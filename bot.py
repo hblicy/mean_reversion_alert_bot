@@ -328,6 +328,19 @@ class VariationalMetadataSource(HttpSource):
                 utc_now(),
                 {"quote_size": quote_size, "assets": {"BTC": btc_meta, "XAG": xag_meta}},
             )
+        if pair == "BZ_CL":
+            bz, bz_meta = self._price("BZ", quote_size)
+            cl, cl_meta = self._price("CL", quote_size)
+            return PriceSnapshot(
+                "BZ",
+                "CL",
+                bz,
+                cl,
+                bz / cl,
+                self.name,
+                utc_now(),
+                {"quote_size": quote_size, "assets": {"BZ": bz_meta, "CL": cl_meta}},
+            )
         raise ValueError(f"{self.name} does not support pair {pair}")
 
 
@@ -472,6 +485,16 @@ def suggested_operations(signal: Signal, snap: PriceSnapshot) -> list[str]:
             f"• 平 BTC 多单 ≈ ${snap.base_price:,.2f}",
             f"• 回补 XAG 空单 ≈ ${snap.quote_price:,.4f}",
         ]
+    if signal.direction == "CLOSE_SHORT_BZ_LONG_CL":
+        return [
+            f"• 回补 BZ-PERP ≈ ${snap.base_price:,.4f}",
+            f"• 平 CL-PERP 多单 ≈ ${snap.quote_price:,.4f}",
+        ]
+    if signal.direction == "CLOSE_LONG_BZ_SHORT_CL":
+        return [
+            f"• 平 BZ-PERP 多单 ≈ ${snap.base_price:,.4f}",
+            f"• 回补 CL-PERP ≈ ${snap.quote_price:,.4f}",
+        ]
     if signal.direction == "LONG_BTC_SHORT_ETH":
         return [
             f"• LONG BTC-PERP（市价）≈ ${snap.quote_price:,.2f}",
@@ -491,6 +514,16 @@ def suggested_operations(signal: Signal, snap: PriceSnapshot) -> list[str]:
         return [
             f"• LONG BTC-PERP（市价）≈ ${snap.base_price:,.2f}",
             f"• SHORT XAG-PERP（市价）≈ ${snap.quote_price:,.4f}",
+        ]
+    if signal.direction == "SHORT_BZ_LONG_CL":
+        return [
+            f"• SHORT BZ-PERP（市价）≈ ${snap.base_price:,.4f}",
+            f"• LONG CL-PERP（市价）≈ ${snap.quote_price:,.4f}",
+        ]
+    if signal.direction == "LONG_BZ_SHORT_CL":
+        return [
+            f"• LONG BZ-PERP（市价）≈ ${snap.base_price:,.4f}",
+            f"• SHORT CL-PERP（市价）≈ ${snap.quote_price:,.4f}",
         ]
     return []
 
@@ -566,10 +599,14 @@ def action_label(signal: Signal) -> str:
         "SHORT_BTC_LONG_ETH": "空 BTC / 多 ETH（仅观察）",
         "SHORT_BTC_LONG_XAG": "空 BTC / 多 XAG",
         "LONG_BTC_SHORT_XAG": "多 BTC / 空 XAG",
+        "SHORT_BZ_LONG_CL": "空 BZ / 多 CL",
+        "LONG_BZ_SHORT_CL": "多 BZ / 空 CL",
         "CLOSE_LONG_BTC_SHORT_ETH": "平多 BTC / 平空 ETH",
         "CLOSE_SHORT_BTC_LONG_ETH": "平空 BTC / 平多 ETH",
         "CLOSE_SHORT_BTC_LONG_XAG": "平空 BTC / 平多 XAG",
         "CLOSE_LONG_BTC_SHORT_XAG": "平多 BTC / 平空 XAG",
+        "CLOSE_SHORT_BZ_LONG_CL": "平空 BZ / 平多 CL",
+        "CLOSE_LONG_BZ_SHORT_CL": "平多 BZ / 平空 CL",
     }
     return labels.get(signal.direction, signal.action)
 
@@ -603,16 +640,28 @@ def build_signal(cfg: dict[str, Any], z: float, prev_z: float | None, z_vol: flo
         return Signal("ENTRY", "LONG_BTC_SHORT_ETH", "", f"ETH/BTC 高位 z={z:+.3f}", tradeable, caution)
 
     if z >= z_open:
-        return Signal("ENTRY", "SHORT_BTC_LONG_XAG" if cfg["pair"] == "XAG_BTC" else "LONG_RATIO", "", f"比率高位 z={z:+.3f}", True)
+        if cfg["pair"] == "XAG_BTC":
+            direction = "SHORT_BTC_LONG_XAG"
+        elif cfg["pair"] == "BZ_CL":
+            direction = "SHORT_BZ_LONG_CL"
+        else:
+            direction = "LONG_RATIO"
+        return Signal("ENTRY", direction, "", f"比率高位 z={z:+.3f}", True)
     if z <= -z_open:
-        return Signal("ENTRY", "LONG_BTC_SHORT_XAG" if cfg["pair"] == "XAG_BTC" else "SHORT_RATIO", "", f"比率低位 z={z:+.3f}", True)
+        if cfg["pair"] == "XAG_BTC":
+            direction = "LONG_BTC_SHORT_XAG"
+        elif cfg["pair"] == "BZ_CL":
+            direction = "LONG_BZ_SHORT_CL"
+        else:
+            direction = "SHORT_RATIO"
+        return Signal("ENTRY", direction, "", f"比率低位 z={z:+.3f}", True)
     return None
 
 
 def ratio_side(direction: str) -> str:
-    if direction in ("LONG_BTC_SHORT_ETH", "SHORT_BTC_LONG_XAG"):
+    if direction in ("LONG_BTC_SHORT_ETH", "SHORT_BTC_LONG_XAG", "SHORT_BZ_LONG_CL"):
         return "short_ratio"
-    if direction in ("LONG_BTC_SHORT_XAG", "SHORT_BTC_LONG_ETH"):
+    if direction in ("LONG_BTC_SHORT_XAG", "SHORT_BTC_LONG_ETH", "LONG_BZ_SHORT_CL"):
         return "long_ratio"
     return ""
 
