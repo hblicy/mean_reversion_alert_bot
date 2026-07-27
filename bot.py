@@ -432,7 +432,7 @@ def format_message(cfg: dict[str, Any], snap: PriceSnapshot, z: float, z_vol: fl
     if ops:
         lines.extend(["", "建议操作：", *ops])
 
-    estimate = format_entry_estimate(cfg)
+    estimate = format_entry_estimate(cfg, snap)
     if estimate:
         lines.extend(["", *estimate])
 
@@ -552,27 +552,42 @@ def position_size_usd(cfg: dict[str, Any]) -> float:
     return float(cfg.get("position_size_usd", 1000))
 
 
-def spread_cost_pct(cfg: dict[str, Any]) -> float:
-    return float(cfg.get("spread_cost_pct", 0))
+def one_way_bbo_cost_pct(snap: PriceSnapshot) -> float:
+    assets = snap.metadata.get("assets")
+    if not assets:
+        raise ValueError(f"Missing BBO metadata for {snap.base}/{snap.quote}")
+
+    cost_pct = 0.0
+    for ticker in (snap.base, snap.quote):
+        asset = assets.get(ticker)
+        if not asset:
+            raise ValueError(f"Missing BBO metadata for {ticker}")
+        bid = float(asset["bid"])
+        ask = float(asset["ask"])
+        if bid <= 0 or ask <= 0:
+            raise ValueError(f"Bad BBO for {ticker}: bid={bid}, ask={ask}")
+        cost_pct += (ask - bid) / (ask + bid) * 100
+    return cost_pct
 
 
-def spread_cost_usd(cfg: dict[str, Any]) -> float:
-    size = position_size_usd(cfg)
-    return size * spread_cost_pct(cfg) / 100
+def market_slippage_tolerance_pct(cfg: dict[str, Any]) -> float:
+    return float(cfg["market_slippage_tolerance_pct"])
 
 
-def format_entry_estimate(cfg: dict[str, Any]) -> list[str]:
+def format_entry_estimate(cfg: dict[str, Any], snap: PriceSnapshot) -> list[str]:
     size = position_size_usd(cfg)
     target_pct = float(cfg.get("close_profit_ratio_pct", 0.5))
-    gross = size * target_pct / 100
-    spread = spread_cost_usd(cfg)
-    net = gross - spread
+    entry_bbo_cost_pct = one_way_bbo_cost_pct(snap)
+    estimated_round_trip_bbo_pct = entry_bbo_cost_pct * 2
+    slippage_pct = market_slippage_tolerance_pct(cfg)
+    required_move_pct = target_pct + estimated_round_trip_bbo_pct + slippage_pct
     lines = [
         f"预估（每腿 ${size:,.0f}）：",
-        f"• 盈利目标：{target_pct:.2f}% ≈ ${gross:,.2f}",
-        f"• 点差磨损：${spread:,.2f}（{spread_cost_pct(cfg):.4f}%）",
+        f"• 净利润目标：{target_pct:.2f}% ≈ ${size * target_pct / 100:,.2f}",
+        f"• 当前开平点差估算：{estimated_round_trip_bbo_pct:.4f}% ≈ ${size * estimated_round_trip_bbo_pct / 100:,.2f}",
+        f"• 整笔开平滑点缓冲：{slippage_pct:.2f}% ≈ ${size * slippage_pct / 100:,.2f}",
+        f"• 预计平仓所需有利移动：{required_move_pct:.4f}%",
     ]
-    lines.append(f"• 预估净利：${net:,.2f}")
     return lines
 
 
@@ -582,14 +597,18 @@ def format_close_estimate(cfg: dict[str, Any], signal: Signal) -> list[str]:
         return []
     size = position_size_usd(cfg)
     gross = size * float(move_pct) / 100
-    spread = spread_cost_usd(cfg)
-    net = gross - spread
+    entry_bbo_cost_pct = float(signal.details["entry_bbo_cost_pct"])
+    exit_bbo_cost_pct = float(signal.details["exit_bbo_cost_pct"])
+    slippage_pct = float(signal.details["slippage_tolerance_pct"])
+    net_profit_pct = float(signal.details["net_profit_pct"])
     lines = [
         f"预估（每腿 ${size:,.0f}）：",
         f"• 当前有利移动：{float(move_pct):.3f}% ≈ ${gross:,.2f}",
-        f"• 点差磨损：${spread:,.2f}（{spread_cost_pct(cfg):.4f}%）",
+        f"• 开仓点差：{entry_bbo_cost_pct:.4f}% ≈ ${size * entry_bbo_cost_pct / 100:,.2f}",
+        f"• 当前平仓点差：{exit_bbo_cost_pct:.4f}% ≈ ${size * exit_bbo_cost_pct / 100:,.2f}",
+        f"• 整笔开平滑点缓冲：{slippage_pct:.2f}% ≈ ${size * slippage_pct / 100:,.2f}",
     ]
-    lines.append(f"• 预估净利：${net:,.2f}")
+    lines.append(f"• 预估净利：{net_profit_pct:.3f}% ≈ ${size * net_profit_pct / 100:,.2f}")
     return lines
 
 
@@ -684,18 +703,36 @@ def build_close_signal(cfg: dict[str, Any], snap: PriceSnapshot, z: float, posit
     z_close = float(cfg.get("z_close", 0.35))
     profit_pct = float(cfg.get("close_profit_ratio_pct", 0.10))
     move_pct = favorable_ratio_move_pct(position, snap.ratio)
+    if "entry_bbo_cost_pct" not in position:
+        raise ValueError(f"Shadow position for {cfg['label']} lacks entry BBO cost; clear the legacy position before using dynamic close costs")
+    entry_bbo_cost_pct = float(position["entry_bbo_cost_pct"])
+    exit_bbo_cost_pct = one_way_bbo_cost_pct(snap)
+    slippage_pct = market_slippage_tolerance_pct(cfg)
+    net_profit_pct = move_pct - entry_bbo_cost_pct - exit_bbo_cost_pct - slippage_pct
 
-    reasons = []
+    if net_profit_pct < profit_pct:
+        return None
+
+    reasons = [f"预估净收益 {net_profit_pct:.3f}%"]
     if cfg.get("close_on_z_reversion", False) and abs(z) <= z_close:
         reasons.append(f"Z 回归到 {z:+.3f}")
-    if move_pct >= profit_pct:
-        reasons.append(f"ratio 有利移动 {move_pct:.3f}%")
-    if not reasons:
-        return None
 
     entry_direction = str(position.get("direction", ""))
     direction = f"CLOSE_{entry_direction}"
-    return Signal("CLOSE", direction, "", "；".join(reasons), True, details={"move_pct": move_pct})
+    return Signal(
+        "CLOSE",
+        direction,
+        "",
+        "；".join(reasons),
+        True,
+        details={
+            "move_pct": move_pct,
+            "entry_bbo_cost_pct": entry_bbo_cost_pct,
+            "exit_bbo_cost_pct": exit_bbo_cost_pct,
+            "slippage_tolerance_pct": slippage_pct,
+            "net_profit_pct": net_profit_pct,
+        },
+    )
 
 
 def make_shadow_position(cfg: dict[str, Any], signal: Signal, snap: PriceSnapshot, z: float) -> dict[str, Any]:
@@ -706,6 +743,7 @@ def make_shadow_position(cfg: dict[str, Any], signal: Signal, snap: PriceSnapsho
         "entry_z": z,
         "entry_base_price": snap.base_price,
         "entry_quote_price": snap.quote_price,
+        "entry_bbo_cost_pct": one_way_bbo_cost_pct(snap),
         "position_size_usd": position_size_usd(cfg),
         "entry_time": utc_now().isoformat(),
     }
