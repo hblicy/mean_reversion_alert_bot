@@ -18,6 +18,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from math import isfinite
 from statistics import mean, stdev
 from typing import Any
 
@@ -29,6 +30,10 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "config.json"
 
 logger = logging.getLogger("alert_bot")
+
+
+class MarketDataError(ValueError):
+    pass
 
 
 @dataclass
@@ -96,13 +101,18 @@ class AlertState:
         self.load()
 
     def load(self) -> None:
-        if not self.path.exists():
-            return
         try:
-            self.data = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            logger.warning("Failed to load state file %s: %s", self.path, exc)
-            self.data = {"alerts": {}, "history": {}}
+            content = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return
+        except OSError:
+            logger.exception("Cannot read state file %s; refusing to reset tracking state", self.path)
+            raise
+        try:
+            self.data = json.loads(content)
+        except json.JSONDecodeError:
+            logger.exception("Invalid state file %s; refusing to reset tracking state", self.path)
+            raise
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,9 +130,11 @@ class AlertState:
         last_ts = self.data.setdefault("alerts", {}).get(key)
         now = time.time()
         if last_ts is None or now - float(last_ts) >= cooldown_sec:
-            self.data["alerts"][key] = now
             return True
         return False
+
+    def mark_sent(self, key: str) -> None:
+        self.data.setdefault("alerts", {})[key] = time.time()
 
     def shadow_position(self, monitor_id: str) -> dict[str, Any] | None:
         pos = self.data.setdefault("shadow_positions", {}).get(monitor_id)
@@ -143,7 +155,8 @@ class TelegramNotifier:
 
     def send(self, message: str) -> bool:
         if self.print_messages:
-            print(message)
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(message.encode(encoding, errors="backslashreplace").decode(encoding))
             print("-" * 60)
         if not self.token or not self.chat_id:
             logger.info("Telegram env is not configured; message printed locally only.")
@@ -151,9 +164,13 @@ class TelegramNotifier:
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         payload = {"chat_id": self.chat_id, "text": message, "disable_web_page_preview": True}
         response = requests.post(url, json=payload, timeout=15)
+        if response.status_code >= 400:
+            logger.warning("Telegram delivery rejected: HTTP %s; will retry", response.status_code)
+            return False
         data = response.json()
         if not data.get("ok"):
-            raise RuntimeError(f"Telegram send failed: {data}")
+            logger.warning("Telegram delivery rejected: error_code=%s; will retry", data.get("error_code", "unknown"))
+            return False
         return True
 
 
@@ -259,6 +276,8 @@ class VariationalMetadataSource(HttpSource):
         if self.__class__._cache_data is not None and now - self.__class__._cache_ts < self.__class__._cache_ttl_sec:
             return self.__class__._cache_data
         data = self._get_json(self.url)
+        if not isinstance(data, dict) or not isinstance(data.get("listings"), list):
+            raise MarketDataError("Variational response has no listings array")
         self.__class__._cache_data = data
         self.__class__._cache_ts = now
         return data
@@ -266,14 +285,20 @@ class VariationalMetadataSource(HttpSource):
     def _listing(self, ticker: str) -> dict[str, Any]:
         wanted = ticker.upper()
         for item in self._stats().get("listings", []):
+            if not isinstance(item, dict):
+                raise MarketDataError("Variational listing must be an object")
             if str(item.get("ticker", "")).upper() == wanted:
                 return item
-        raise ValueError(f"Variational listing not found: {ticker}")
+        raise MarketDataError(f"Variational listing not found: {ticker}")
 
     def _price(self, ticker: str, quote_size: str) -> tuple[float, dict[str, Any]]:
         listing = self._listing(ticker)
         quotes = listing.get("quotes") or {}
+        if not isinstance(quotes, dict):
+            raise MarketDataError(f"{ticker}: quotes must be an object")
         quote = quotes.get(quote_size) or {}
+        if not isinstance(quote, dict):
+            raise MarketDataError(f"{ticker}: {quote_size} must be an object")
         bid = _safe_float(quote.get("bid"))
         ask = _safe_float(quote.get("ask"))
         price_source = "quote"
@@ -282,8 +307,8 @@ class VariationalMetadataSource(HttpSource):
         else:
             price = _safe_float(listing.get("mark_price"))
             price_source = "mark_price"
-        if price <= 0:
-            raise ValueError(f"Bad Variational price for {ticker}")
+        if not isfinite(price) or price <= 0:
+            raise MarketDataError(f"Bad Variational price for {ticker}")
 
         updated_at = str(quotes.get("updated_at", ""))
         return price, {
@@ -295,8 +320,6 @@ class VariationalMetadataSource(HttpSource):
             "ask": ask,
             "quote_updated_at": updated_at,
             "quote_age_sec": quote_age_seconds(updated_at),
-            "funding_rate": _safe_float(listing.get("funding_rate")),
-            "funding_interval_s": int(_safe_float(listing.get("funding_interval_s"))),
             "base_spread_bps": _safe_float(listing.get("base_spread_bps")),
         }
 
@@ -341,6 +364,12 @@ class VariationalMetadataSource(HttpSource):
                 utc_now(),
                 {"quote_size": quote_size, "assets": {"BZ": bz_meta, "CL": cl_meta}},
             )
+        if pair == "XAG_XAU":
+            xag, xag_meta = self._price("XAG", quote_size)
+            xau, xau_meta = self._price("XAU", quote_size)
+            return PriceSnapshot("XAG", "XAU", xag, xau, xag / xau,
+                                 self.name, utc_now(),
+                                 {"quote_size": quote_size, "assets": {"XAG": xag_meta, "XAU": xau_meta}})
         raise ValueError(f"{self.name} does not support pair {pair}")
 
 
@@ -395,221 +424,89 @@ def init_monitors(config: dict[str, Any], state: AlertState) -> list[dict[str, A
             raise ValueError(f"Unknown source {source_name}. Available: {', '.join(SOURCES)}")
         item = dict(item)
         item["_source"] = SOURCES[source_name]()
+        sample = state.data.setdefault("samples", {}).get(item["id"], {})
+        # Old polling histories have no timestamps and cannot be mixed with timed samples.
+        history = state.history(item["id"]) if sample.get("interval") == item.get("sample_interval_sec", 600) else []
         item["_calc"] = ZScoreCalculator(
             int(item["window_size"]),
             int(item.get("z_vol_window", 20)),
-            state.history(item["id"]),
+            history,
         )
         item["_prev_z"] = None
         monitors.append(item)
     return monitors
 
 
-def signal_emoji(signal: Signal) -> str:
-    if signal.level == "CLOSE":
-        return "🔵"
-    if signal.level == "ENTRY":
-        return "🟢"
-    return "🟡"
 
 
-def format_message(cfg: dict[str, Any], snap: PriceSnapshot, z: float, z_vol: float | None, signal: Signal) -> str:
+def format_message(cfg: dict[str, Any], snap: PriceSnapshot, z: float | None, z_vol: float | None, signal: Signal) -> str:
     if signal.level == "CLOSE":
         return format_close_message(cfg, snap, z, signal)
 
-    status = "平仓提醒" if signal.level == "CLOSE" else "可评估" if signal.tradeable else "观察/过滤"
     lines = [
-        f"{signal_emoji(signal)} [{signal.level}] {cfg['label']} {status}",
-        f"方向：{action_label(signal)}",
-        f"Z：{z:+.3f}（开仓 {float(cfg['z_open']):+.2f}，预警 {float(cfg.get('z_watch', cfg['z_open'])):+.2f}）",
+        f"🟢 [ENTRY] {cfg['label']} 行情提醒",
+        f"行情源：{'Variational' if snap.source == VariationalMetadataSource.name else snap.source}",
+        f"回归方向参考：{action_label(signal)}",
+        f"滚动 Z：{z:+.3f}（触发阈值 {float(cfg['z_open']):.2f}）",
         f"{snap.base}/{snap.quote}：{snap.ratio:.8f}",
-        f"价格：{snap.base} ${snap.base_price:,.4f}｜{snap.quote} ${snap.quote_price:,.4f}",
+        f"行情源中间价：{snap.base} ${snap.base_price:,.4f}｜{snap.quote} ${snap.quote_price:,.4f}",
     ]
-    if signal.level == "CLOSE" and signal.reason:
-        lines.append(f"触发：{signal.reason}")
-
-    ops = suggested_operations(signal, snap)
-    if ops:
-        lines.extend(["", "建议操作：", *ops])
-
-    estimate = format_entry_estimate(cfg, snap)
-    if estimate:
-        lines.extend(["", *estimate])
-
+    reference_mean = signal.details["reference_mean"]
+    width = signal.details["reference_std"] * float(cfg.get("z_close", 0.35))
+    lines.append(f"本次固定均值：{reference_mean:.8f}")
+    lines.append(f"回归观察区间：{reference_mean - width:.8f} ～ {reference_mean + width:.8f}")
     if snap.source == VariationalMetadataSource.name:
-        lines.extend(["", *format_variational_metadata(snap)])
-
-    if signal.caution:
-        lines.extend(["", f"注意：{signal.caution}"])
-
-    lines.append("")
-    lines.append("只提醒不下单；手动确认 Variational 盘口。")
+        lines.extend(format_variational_metadata(snap))
+    lines.extend([
+        f"信号最多跟踪 {float(cfg.get('max_holding_hours', 72)):g} 小时；到期提醒结束跟踪。",
+        "仅供行情参考，不代表可成交价格或收益。请在实际交易平台自行核对合约、手续费、点差及隔夜成本。",
+        "不指定执行平台，不下单。",
+    ])
     return "\n".join(lines)
 
 
-def format_close_message(cfg: dict[str, Any], snap: PriceSnapshot, z: float, signal: Signal) -> str:
+def format_close_message(cfg: dict[str, Any], snap: PriceSnapshot, z: float | None, signal: Signal) -> str:
     lines = [
-        f"🔵 [CLOSE] {cfg['label']} 平仓信号",
-        "",
-        f"原因：{signal.reason or '达到盈利目标'}",
-        f"{snap.base}/{snap.quote} z-score：{z:+.3f}",
+        f"🔵 [CLOSE] {cfg['label']} 结束跟踪提醒",
+        f"行情源：{'Variational' if snap.source == VariationalMetadataSource.name else snap.source}",
+        f"原因：{signal.reason}",
+        f"对应方向：{action_label(signal)}",
         f"{snap.base}/{snap.quote}：{snap.ratio:.8f}",
-        "",
-        "建议：市价平仓全部对冲头寸",
-        "⚠️ 提醒：两边都要平，别漏单边。",
     ]
-    estimate = format_close_estimate(cfg, signal)
-    if estimate:
-        lines.extend(["", *estimate])
+    if z is not None:
+        lines.append(f"当前滚动 Z：{z:+.3f}（仅供观察）")
+    if "reference_z" in signal.details:
+        lines.append(f"相对 ENTRY 固定基准的 Z：{signal.details['reference_z']:+.3f}")
+    lines.extend([
+        f"信号方向上的比率变化：{signal.details['move_pct']:+.3f}%（不是持仓收益率）",
+        f"ENTRY 信号已持续：{signal.details['holding_hours']:.2f} 小时",
+        "这是行情跟踪提醒，不代表你已成交或已经盈利。",
+        "若已跟随，请在实际交易平台自行核对两腿持仓、可成交报价及成本，再决定退出。",
+    ])
     return "\n".join(lines)
 
 
-def suggested_operations(signal: Signal, snap: PriceSnapshot) -> list[str]:
-    if signal.direction == "CLOSE_LONG_BTC_SHORT_ETH":
-        return [
-            f"• 平 BTC 多单 ≈ ${snap.quote_price:,.2f}",
-            f"• 回补 ETH 空单 ≈ ${snap.base_price:,.2f}",
-        ]
-    if signal.direction == "CLOSE_SHORT_BTC_LONG_ETH":
-        return [
-            f"• 回补 BTC 空单 ≈ ${snap.quote_price:,.2f}",
-            f"• 平 ETH 多单 ≈ ${snap.base_price:,.2f}",
-        ]
-    if signal.direction == "CLOSE_SHORT_BTC_LONG_XAG":
-        return [
-            f"• 回补 BTC 空单 ≈ ${snap.base_price:,.2f}",
-            f"• 平 XAG 多单 ≈ ${snap.quote_price:,.4f}",
-        ]
-    if signal.direction == "CLOSE_LONG_BTC_SHORT_XAG":
-        return [
-            f"• 平 BTC 多单 ≈ ${snap.base_price:,.2f}",
-            f"• 回补 XAG 空单 ≈ ${snap.quote_price:,.4f}",
-        ]
-    if signal.direction == "CLOSE_SHORT_BZ_LONG_CL":
-        return [
-            f"• 回补 BZ-PERP ≈ ${snap.base_price:,.4f}",
-            f"• 平 CL-PERP 多单 ≈ ${snap.quote_price:,.4f}",
-        ]
-    if signal.direction == "CLOSE_LONG_BZ_SHORT_CL":
-        return [
-            f"• 平 BZ-PERP 多单 ≈ ${snap.base_price:,.4f}",
-            f"• 回补 CL-PERP ≈ ${snap.quote_price:,.4f}",
-        ]
-    if signal.direction == "LONG_BTC_SHORT_ETH":
-        return [
-            f"• LONG BTC-PERP（市价）≈ ${snap.quote_price:,.2f}",
-            f"• SHORT ETH-PERP（市价）≈ ${snap.base_price:,.2f}",
-        ]
-    if signal.direction == "SHORT_BTC_LONG_ETH":
-        return [
-            f"• SHORT BTC-PERP（仅观察）≈ ${snap.quote_price:,.2f}",
-            f"• LONG ETH-PERP（仅观察）≈ ${snap.base_price:,.2f}",
-        ]
-    if signal.direction == "SHORT_BTC_LONG_XAG":
-        return [
-            f"• SHORT BTC-PERP（市价）≈ ${snap.base_price:,.2f}",
-            f"• LONG XAG-PERP（市价）≈ ${snap.quote_price:,.4f}",
-        ]
-    if signal.direction == "LONG_BTC_SHORT_XAG":
-        return [
-            f"• LONG BTC-PERP（市价）≈ ${snap.base_price:,.2f}",
-            f"• SHORT XAG-PERP（市价）≈ ${snap.quote_price:,.4f}",
-        ]
-    if signal.direction == "SHORT_BZ_LONG_CL":
-        return [
-            f"• SHORT BZ-PERP（市价）≈ ${snap.base_price:,.4f}",
-            f"• LONG CL-PERP（市价）≈ ${snap.quote_price:,.4f}",
-        ]
-    if signal.direction == "LONG_BZ_SHORT_CL":
-        return [
-            f"• LONG BZ-PERP（市价）≈ ${snap.base_price:,.4f}",
-            f"• SHORT CL-PERP（市价）≈ ${snap.quote_price:,.4f}",
-        ]
-    return []
 
 
 def format_variational_metadata(snap: PriceSnapshot) -> list[str]:
-    assets = snap.metadata.get("assets", {})
-    if not assets:
-        return []
-
-    quote_size = snap.metadata.get("quote_size", "N/A")
     ages = []
-    fundings = []
-    for ticker, meta in assets.items():
-        age = meta.get("quote_age_sec")
-        age_text = f"{age:.0f}s" if age is not None else "N/A"
-        ages.append(f"{ticker} {age_text}")
-        fundings.append(f"{ticker} {meta.get('funding_rate', 0.0):.6f}")
-
-    return [
-        f"报价：{quote_size}｜age {' / '.join(ages)}",
-        f"资金费率：{'｜'.join(fundings)}",
-    ]
+    for ticker, meta in snap.metadata.get("assets", {}).items():
+        age = quote_age_seconds(meta.get("quote_updated_at", ""))
+        ages.append(f"{ticker} {age:.0f}s" if age is not None else f"{ticker} N/A")
+    return [f"行情报价档位：{snap.metadata.get('quote_size', 'N/A')}｜age {' / '.join(ages)}"]
 
 
-def position_size_usd(cfg: dict[str, Any]) -> float:
-    return float(cfg.get("position_size_usd", 1000))
-
-
-def one_way_bbo_cost_pct(snap: PriceSnapshot) -> float:
+def validate_bbo(snap: PriceSnapshot) -> None:
     assets = snap.metadata.get("assets")
     if not assets:
         raise ValueError(f"Missing BBO metadata for {snap.base}/{snap.quote}")
-
-    cost_pct = 0.0
     for ticker in (snap.base, snap.quote):
         asset = assets.get(ticker)
         if not asset:
             raise ValueError(f"Missing BBO metadata for {ticker}")
-        bid = float(asset["bid"])
-        ask = float(asset["ask"])
-        if bid <= 0 or ask <= 0:
+        bid, ask = float(asset["bid"]), float(asset["ask"])
+        if not (isfinite(bid) and isfinite(ask) and 0 < bid <= ask):
             raise ValueError(f"Bad BBO for {ticker}: bid={bid}, ask={ask}")
-        cost_pct += (ask - bid) / (ask + bid) * 100
-    return cost_pct
-
-
-def market_slippage_tolerance_pct(cfg: dict[str, Any]) -> float:
-    return float(cfg["market_slippage_tolerance_pct"])
-
-
-def format_entry_estimate(cfg: dict[str, Any], snap: PriceSnapshot) -> list[str]:
-    size = position_size_usd(cfg)
-    target_pct = float(cfg.get("close_profit_ratio_pct", 0.5))
-    entry_bbo_cost_pct = one_way_bbo_cost_pct(snap)
-    estimated_round_trip_bbo_pct = entry_bbo_cost_pct * 2
-    slippage_pct = market_slippage_tolerance_pct(cfg)
-    required_move_pct = target_pct + estimated_round_trip_bbo_pct + slippage_pct
-    lines = [
-        f"预估（每腿 ${size:,.0f}）：",
-        f"• 净利润目标：{target_pct:.2f}% ≈ ${size * target_pct / 100:,.2f}",
-        f"• 当前开平点差估算：{estimated_round_trip_bbo_pct:.4f}% ≈ ${size * estimated_round_trip_bbo_pct / 100:,.2f}",
-        f"• 整笔开平滑点缓冲：{slippage_pct:.2f}% ≈ ${size * slippage_pct / 100:,.2f}",
-        f"• 预计平仓所需有利移动：{required_move_pct:.4f}%",
-    ]
-    return lines
-
-
-def format_close_estimate(cfg: dict[str, Any], signal: Signal) -> list[str]:
-    move_pct = signal.details.get("move_pct")
-    if move_pct is None:
-        return []
-    size = position_size_usd(cfg)
-    gross = size * float(move_pct) / 100
-    entry_bbo_cost_pct = float(signal.details["entry_bbo_cost_pct"])
-    exit_bbo_cost_pct = float(signal.details["exit_bbo_cost_pct"])
-    slippage_pct = float(signal.details["slippage_tolerance_pct"])
-    net_profit_pct = float(signal.details["net_profit_pct"])
-    lines = [
-        f"预估（每腿 ${size:,.0f}）：",
-        f"• 当前有利移动：{float(move_pct):.3f}% ≈ ${gross:,.2f}",
-        f"• 开仓点差：{entry_bbo_cost_pct:.4f}% ≈ ${size * entry_bbo_cost_pct / 100:,.2f}",
-        f"• 当前平仓点差：{exit_bbo_cost_pct:.4f}% ≈ ${size * exit_bbo_cost_pct / 100:,.2f}",
-        f"• 整笔开平滑点缓冲：{slippage_pct:.2f}% ≈ ${size * slippage_pct / 100:,.2f}",
-    ]
-    lines.append(f"• 预估净利：{net_profit_pct:.3f}% ≈ ${size * net_profit_pct / 100:,.2f}")
-    return lines
 
 
 def action_label(signal: Signal) -> str:
@@ -620,6 +517,10 @@ def action_label(signal: Signal) -> str:
         "LONG_BTC_SHORT_XAG": "多 BTC / 空 XAG",
         "SHORT_BZ_LONG_CL": "空 BZ / 多 CL",
         "LONG_BZ_SHORT_CL": "多 BZ / 空 CL",
+        "SHORT_XAG_LONG_XAU": "空 XAG / 多 XAU",
+        "LONG_XAG_SHORT_XAU": "多 XAG / 空 XAU",
+        "CLOSE_SHORT_XAG_LONG_XAU": "平空 XAG / 平多 XAU",
+        "CLOSE_LONG_XAG_SHORT_XAU": "平多 XAG / 平空 XAU",
         "CLOSE_LONG_BTC_SHORT_ETH": "平多 BTC / 平空 ETH",
         "CLOSE_SHORT_BTC_LONG_ETH": "平空 BTC / 平多 ETH",
         "CLOSE_SHORT_BTC_LONG_XAG": "平空 BTC / 平多 XAG",
@@ -642,27 +543,29 @@ def build_signal(cfg: dict[str, Any], z: float, prev_z: float | None, z_vol: flo
     if level != "ENTRY":
         return None
 
+    if cfg.get("entry_require_cross", False):
+        if prev_z is None or z * prev_z <= 0 or abs(z) >= abs(prev_z):
+            return None
+    max_z = float(cfg.get("entry_max_z", 0) or 0)
+    z_vol_max = float(cfg.get("z_vol_max", 0) or 0)
+    if max_z > 0 and abs(z) > max_z:
+        return None
+    if z_vol_max > 0 and (z_vol is None or z_vol > z_vol_max):
+        return None
+
     strategy = cfg.get("strategy", "two_way")
     if strategy == "btc_strength_bias":
         if z < z_open:
             return None
-        caution = ""
-        tradeable = True
-        max_z = float(cfg.get("entry_max_z", 0) or 0)
-        if max_z > 0 and z > max_z:
-            tradeable = False
-            caution = f"Z>{max_z:.2f}，偏离过大，谨慎追单。"
-        z_vol_max = float(cfg.get("z_vol_max", 0) or 0)
-        if z_vol_max > 0 and z_vol is not None and z_vol > z_vol_max:
-            tradeable = False
-            caution = f"Z 波动 {z_vol:.2f}>{z_vol_max:.2f}，过滤。"
-        return Signal("ENTRY", "LONG_BTC_SHORT_ETH", "", f"ETH/BTC 高位 z={z:+.3f}", tradeable, caution)
+        return Signal("ENTRY", "LONG_BTC_SHORT_ETH", "", f"ETH/BTC 高位 z={z:+.3f}", True)
 
     if z >= z_open:
         if cfg["pair"] == "XAG_BTC":
             direction = "SHORT_BTC_LONG_XAG"
         elif cfg["pair"] == "BZ_CL":
             direction = "SHORT_BZ_LONG_CL"
+        elif cfg["pair"] == "XAG_XAU":
+            direction = "SHORT_XAG_LONG_XAU"
         else:
             direction = "LONG_RATIO"
         return Signal("ENTRY", direction, "", f"比率高位 z={z:+.3f}", True)
@@ -671,6 +574,8 @@ def build_signal(cfg: dict[str, Any], z: float, prev_z: float | None, z_vol: flo
             direction = "LONG_BTC_SHORT_XAG"
         elif cfg["pair"] == "BZ_CL":
             direction = "LONG_BZ_SHORT_CL"
+        elif cfg["pair"] == "XAG_XAU":
+            direction = "LONG_XAG_SHORT_XAU"
         else:
             direction = "SHORT_RATIO"
         return Signal("ENTRY", direction, "", f"比率低位 z={z:+.3f}", True)
@@ -678,9 +583,9 @@ def build_signal(cfg: dict[str, Any], z: float, prev_z: float | None, z_vol: flo
 
 
 def ratio_side(direction: str) -> str:
-    if direction in ("LONG_BTC_SHORT_ETH", "SHORT_BTC_LONG_XAG", "SHORT_BZ_LONG_CL"):
+    if direction in ("LONG_BTC_SHORT_ETH", "SHORT_BTC_LONG_XAG", "SHORT_BZ_LONG_CL", "SHORT_XAG_LONG_XAU"):
         return "short_ratio"
-    if direction in ("LONG_BTC_SHORT_XAG", "SHORT_BTC_LONG_ETH", "LONG_BZ_SHORT_CL"):
+    if direction in ("LONG_BTC_SHORT_XAG", "SHORT_BTC_LONG_ETH", "LONG_BZ_SHORT_CL", "LONG_XAG_SHORT_XAU"):
         return "long_ratio"
     return ""
 
@@ -697,98 +602,245 @@ def favorable_ratio_move_pct(position: dict[str, Any], current_ratio: float) -> 
     return 0.0
 
 
-def build_close_signal(cfg: dict[str, Any], snap: PriceSnapshot, z: float, position: dict[str, Any] | None) -> Signal | None:
+def build_close_signal(cfg: dict[str, Any], snap: PriceSnapshot, z: float | None, position: dict[str, Any] | None) -> Signal | None:
     if not position or not cfg.get("shadow_position_enabled", True):
         return None
-    z_close = float(cfg.get("z_close", 0.35))
-    profit_pct = float(cfg.get("close_profit_ratio_pct", 0.10))
+    side = position["ratio_side"]
+    adverse_sign = 1 if side == "short_ratio" else -1
     move_pct = favorable_ratio_move_pct(position, snap.ratio)
-    if "entry_bbo_cost_pct" not in position:
-        raise ValueError(f"Shadow position for {cfg['label']} lacks entry BBO cost; clear the legacy position before using dynamic close costs")
-    entry_bbo_cost_pct = float(position["entry_bbo_cost_pct"])
-    exit_bbo_cost_pct = one_way_bbo_cost_pct(snap)
-    slippage_pct = market_slippage_tolerance_pct(cfg)
-    net_profit_pct = move_pct - entry_bbo_cost_pct - exit_bbo_cost_pct - slippage_pct
+    details = {
+        "move_pct": move_pct,
+        "holding_hours": (utc_now() - parse_timestamp(position["entry_time"])).total_seconds() / 3600,
+    }
+    reasons = []
+    if "reference_mean" in position and "reference_std" in position:
+        reference_mean = float(position["reference_mean"])
+        reference_std = float(position["reference_std"])
+        reference_z = (snap.ratio - reference_mean) / reference_std
+        details["reference_z"] = reference_z
+        # Crossing the entire band also completes reversion; rolling mean drift does not.
+        boundary = reference_mean + adverse_sign * reference_std * float(position["reference_z_close"])
+        reached = snap.ratio <= boundary if adverse_sign == 1 else snap.ratio >= boundary
+        if move_pct > 0 and reached:
+            reasons.append("比率已回归至 ENTRY 固定均值区间或越过该区间")
+    else:
+        logger.warning("%s legacy signal lacks a frozen reference; reversion close unavailable, risk/timeout tracking retained", cfg["label"])
 
-    if net_profit_pct < profit_pct:
+    max_z = float(cfg.get("entry_max_z", 0) or 0)
+    if z is not None and max_z > 0 and z * adverse_sign > max_z and move_pct < 0:
+        reasons.append(f"风险提醒：比率较 ENTRY 继续恶化且滚动 |Z| 超过 {max_z:g}")
+    if not reasons:
         return None
-
-    reasons = [f"预估净收益 {net_profit_pct:.3f}%"]
-    if cfg.get("close_on_z_reversion", False) and abs(z) <= z_close:
-        reasons.append(f"Z 回归到 {z:+.3f}")
-
-    entry_direction = str(position.get("direction", ""))
-    direction = f"CLOSE_{entry_direction}"
-    return Signal(
-        "CLOSE",
-        direction,
-        "",
-        "；".join(reasons),
-        True,
-        details={
-            "move_pct": move_pct,
-            "entry_bbo_cost_pct": entry_bbo_cost_pct,
-            "exit_bbo_cost_pct": exit_bbo_cost_pct,
-            "slippage_tolerance_pct": slippage_pct,
-            "net_profit_pct": net_profit_pct,
-        },
-    )
+    return Signal("CLOSE", "CLOSE_" + position["direction"], "", "；".join(reasons), details=details)
 
 
-def make_shadow_position(cfg: dict[str, Any], signal: Signal, snap: PriceSnapshot, z: float) -> dict[str, Any]:
+def make_shadow_position(cfg: dict[str, Any], signal: Signal, snap: PriceSnapshot, z: float,
+                         *, reference_mean: float, reference_std: float) -> dict[str, Any]:
+    side = ratio_side(signal.direction)
+    if not side:
+        raise ValueError(f"Unsupported signal direction: {signal.direction}")
+    if not (isfinite(reference_mean) and reference_mean > 0 and isfinite(reference_std) and reference_std > 0):
+        raise ValueError("Signal reference requires a positive finite mean and standard deviation")
     return {
         "direction": signal.direction,
-        "ratio_side": ratio_side(signal.direction),
+        "ratio_side": side,
         "entry_ratio": snap.ratio,
         "entry_z": z,
-        "entry_base_price": snap.base_price,
-        "entry_quote_price": snap.quote_price,
-        "entry_bbo_cost_pct": one_way_bbo_cost_pct(snap),
-        "position_size_usd": position_size_usd(cfg),
         "entry_time": utc_now().isoformat(),
+        "reference_mean": reference_mean,
+        "reference_std": reference_std,
+        "reference_z_close": float(cfg.get("z_close", 0.35)),
     }
 
 
+def parse_timestamp(value: str) -> datetime:
+    timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if timestamp.tzinfo is None:
+        raise ValueError("Timestamp must include timezone")
+    return timestamp.astimezone(timezone.utc)
+
+
+def validate_snapshot(cfg: dict[str, Any], snap: PriceSnapshot) -> list[float]:
+    validate_bbo(snap)
+    if not all(isfinite(p) and p > 0 for p in (snap.base_price, snap.quote_price, snap.ratio)):
+        raise ValueError("Invalid pair prices")
+    timestamps = []
+    for ticker in (snap.base, snap.quote):
+        asset = snap.metadata["assets"][ticker]
+        if asset.get("price_source") != "quote":
+            raise ValueError(f"{ticker}: executable quote unavailable")
+        timestamp = parse_timestamp(asset["quote_updated_at"]).timestamp()
+        age = utc_now().timestamp() - timestamp
+        if age < 0 or age > float(cfg.get("max_quote_age_sec", 120)):
+            raise ValueError(f"{ticker}: stale/future quote, age={age:.1f}s")
+        timestamps.append(timestamp)
+    if max(timestamps) - min(timestamps) > float(cfg.get("max_quote_skew_sec", 30)):
+        raise ValueError("Pair quote timestamps are not aligned")
+    return timestamps
+
+
+
+
+
+def accept_sample(cfg: dict[str, Any], snap: PriceSnapshot, timestamps: list[float], state: AlertState) -> bool:
+    interval = int(cfg.get("sample_interval_sec", 600))
+    bucket = int(min(timestamps) // interval)
+    samples = state.data.setdefault("samples", {})
+    previous = samples.get(cfg["id"], {})
+    if previous.get("interval") == interval:
+        if bucket <= previous["bucket"] or any(t <= p for t, p in zip(timestamps, previous["timestamps"])):
+            return False
+        if bucket - previous["bucket"] > 1:
+            logger.info("%s sample gap; warming a new contiguous window", cfg["label"])
+            cfg["_calc"] = ZScoreCalculator(int(cfg["window_size"]), int(cfg.get("z_vol_window", 20)))
+            cfg["_prev_z"] = None
+    samples[cfg["id"]] = {"interval": interval, "bucket": bucket, "timestamps": timestamps}
+    return True
+
+
+
+
+
+def send_timeout(cfg: dict[str, Any], position: dict[str, Any], state: AlertState, notifier: TelegramNotifier) -> bool:
+    hours = (utc_now() - parse_timestamp(position["entry_time"])).total_seconds() / 3600
+    limit = float(cfg.get("max_holding_hours", 72))
+    if hours < limit:
+        return False
+    signal = Signal("CLOSE", "CLOSE_" + position["direction"], "", "")
+    message = (f"🔵 [CLOSE] {cfg['label']} 超时结束跟踪提醒\n"
+               "行情源：Variational\n"
+               f"原因：ENTRY 信号已持续 {hours:.2f} 小时，达到 {limit:g} 小时上限。\n"
+               f"方向：{action_label(signal)}\n"
+               "无论盈亏都结束本次信号跟踪；若已跟随，请在实际交易平台自行核对两腿持仓、可成交报价及成本，再决定退出。\n"
+               "此提醒不依赖实时行情；不代表你已成交或已经盈利。\n"
+               "信号时间不代表你的实际开仓时间；机器人不会下单。")
+    if notifier.send(message):
+        state.clear_shadow_position(cfg["id"])
+        state.mark_sent(f"{cfg['id']}:{position['direction']}:ENTRY")
+        state.save()
+    else:
+        logger.warning("%s timeout notification not delivered; retaining position for retry", cfg["label"])
+    return True
+
+
 def run_once(monitors: list[dict[str, Any]], state: AlertState, notifier: TelegramNotifier, force: bool = False) -> None:
+    failures = []
     for cfg in monitors:
         try:
+            pending_entries = state.data.setdefault("pending_entries", {})
+            position = state.shadow_position(cfg["id"])
+            if position:
+                pending_entries.pop(cfg["id"], None)
+            if position and send_timeout(cfg, position, state, notifier):
+                continue
             snap = cfg["_source"].snapshot(cfg["pair"], cfg)
+            try:
+                timestamps = validate_snapshot(cfg, snap)
+            except (ValueError, KeyError, TypeError) as exc:
+                pending_entries.pop(cfg["id"], None)
+                logger.warning("%s quote rejected: %s", cfg["label"], exc)
+                continue
+            latest_quotes = state.data.setdefault("latest_quote_timestamps", {})
+            previous_timestamps = latest_quotes.get(
+                cfg["id"], state.data.get("samples", {}).get(cfg["id"], {}).get("timestamps", [])
+            )
+            if any(current < previous for current, previous in zip(timestamps, previous_timestamps)):
+                logger.warning("%s quote timestamp regression: current=%s previous=%s; ignored",
+                               cfg["label"], timestamps, previous_timestamps)
+                continue
+            # Track valid intrabucket quotes too, independently of statistical sampling.
+            latest_quotes[cfg["id"]] = timestamps
+            pending = pending_entries.pop(cfg["id"], None)
+            accepted = accept_sample(cfg, snap, timestamps, state)
             calc: ZScoreCalculator = cfg["_calc"]
-            z = calc.add(snap.ratio)
-            state.set_history(cfg["id"], calc.dump_history())
-            if z is None:
-                logger.info("%s warming up: %s/%s", cfg["label"], calc.count, cfg["window_size"])
-                continue
+            previous_ratio = calc.ratios[-1] if calc.ratios else None
+            target_ratio = mean(calc.ratios) if calc.count >= int(cfg["window_size"]) else None
+            target_std = stdev(calc.ratios) if target_ratio is not None else None
+            prev_z = cfg.get("_prev_z")
+            z = calc.add(snap.ratio) if accepted else None
+            if accepted:
+                state.set_history(cfg["id"], calc.dump_history())
+                cfg["_prev_z"] = z
             if calc.count < int(cfg["window_size"]):
-                logger.info("%s warming up full window: %s/%s z=%+.3f", cfg["label"], calc.count, cfg["window_size"], z)
-                continue
+                z = None
+            elif not accepted:
+                sigma = stdev(calc.ratios)
+                deviation = snap.ratio - mean(calc.ratios)
+                z = deviation / sigma if sigma else (0.0 if deviation == 0 else None)
             z_vol = calc.z_volatility
-            close_signal = build_close_signal(cfg, snap, z, state.shadow_position(cfg["id"]))
+            close_signal = build_close_signal(cfg, snap, z, position)
             if close_signal:
                 key = f"{cfg['id']}:{close_signal.direction}:{close_signal.level}"
                 if force or state.should_send(key, int(cfg.get("close_cooldown_sec", 300))):
-                    notifier.send(format_message(cfg, snap, z, z_vol, close_signal))
-                    state.clear_shadow_position(cfg["id"])
+                    if notifier.send(format_message(cfg, snap, z, z_vol, close_signal)):
+                        state.mark_sent(key)
+                        state.mark_sent(f"{cfg['id']}:{position['direction']}:ENTRY")
+                        state.clear_shadow_position(cfg["id"])
+                        state.save()
                 continue
-            if state.shadow_position(cfg["id"]):
-                logger.info("%s shadow position active; waiting for close signal. ratio=%.8f z=%+.3f", cfg["label"], snap.ratio, z)
+            if position:
+                logger.info("%s shadow position active; ratio=%.8f z=%s", cfg["label"], snap.ratio, z)
                 continue
-            signal = build_signal(cfg, z, cfg.get("_prev_z"), z_vol)
-            cfg["_prev_z"] = z
-            if not signal:
+            if not accepted and pending:
+                age = utc_now().timestamp() - pending["quote_time"]
+                if not 0 <= age <= float(cfg.get("max_quote_age_sec", 120)):
+                    logger.info("%s pending ENTRY expired; awaiting a new signal", cfg["label"])
+                    continue
+                prev_z = pending["prev_z"]
+                z_vol = pending["z_vol"]
+                previous_ratio = pending["previous_ratio"]
+                target_ratio = pending["reference_mean"]
+                target_std = pending["reference_std"]
+            if (not accepted and not pending) or z is None or target_ratio is None:
+                logger.info("%s awaiting fresh/full samples: %s/%s", cfg["label"], calc.count, cfg["window_size"])
+                continue
+            signal = build_signal(cfg, z, prev_z, z_vol)
+            if not signal or not signal.tradeable:
                 logger.info("%s no signal: ratio=%.8f z=%+.3f", cfg["label"], snap.ratio, z)
                 continue
+            if not accepted and signal.direction != pending["direction"]:
+                logger.info("%s pending ENTRY direction no longer valid", cfg["label"])
+                continue
+            if cfg.get("entry_require_cross", False) and (snap.ratio - previous_ratio) * (snap.ratio - target_ratio) >= 0:
+                logger.info("%s entry filtered: ratio has not moved toward prior mean", cfg["label"])
+                continue
+            if not target_std:
+                logger.info("%s entry filtered: reference window has no variance", cfg["label"])
+                continue
+            signal.details.update(reference_mean=target_ratio, reference_std=target_std)
             key = f"{cfg['id']}:{signal.direction}:{signal.level}"
             cooldown = int(cfg.get("cooldown_sec", 1800))
             if force or state.should_send(key, cooldown):
-                notifier.send(format_message(cfg, snap, z, z_vol, signal))
-                if signal.level == "ENTRY" and signal.tradeable and cfg.get("shadow_position_enabled", True):
-                    state.set_shadow_position(cfg["id"], make_shadow_position(cfg, signal, snap, z))
+                candidate = make_shadow_position(cfg, signal, snap, z, reference_mean=target_ratio, reference_std=target_std)
+                # Keep the original observation's deadline; fresh quotes cannot extend a failed signal indefinitely.
+                pending_entries[cfg["id"]] = {
+                    "direction": signal.direction,
+                    "quote_time": min(timestamps) if accepted else pending["quote_time"],
+                    "prev_z": prev_z, "z_vol": z_vol, "previous_ratio": previous_ratio,
+                    "reference_mean": target_ratio, "reference_std": target_std,
+                }
+                state.save()
+                if notifier.send(format_message(cfg, snap, z, z_vol, signal)):
+                    candidate["entry_time"] = utc_now().isoformat()
+                    pending_entries.pop(cfg["id"], None)
+                    state.mark_sent(key)
+                    if cfg.get("shadow_position_enabled", True):
+                        state.set_shadow_position(cfg["id"], candidate)
+                    state.save()
+                else:
+                    logger.warning("%s entry notification not delivered; retained for revalidation and retry", cfg["label"])
             else:
                 logger.info("%s signal suppressed by cooldown: %s %s", cfg["label"], signal.direction, signal.level)
+        except MarketDataError as exc:
+            logger.warning("%s market data rejected: %s; will retry", cfg["label"], exc)
+        except requests.RequestException as exc:
+            logger.warning("%s network request failed (%s); will retry", cfg["label"], type(exc).__name__)
         except Exception as exc:
             logger.exception("Monitor failed for %s: %s", cfg.get("label", cfg.get("id")), exc)
+            failures.append(exc)
     state.save()
+    if failures:
+        raise RuntimeError(f"{len(failures)} monitor(s) failed unexpectedly") from failures[0]
 
 
 def configure_logging(level: str) -> None:
@@ -813,7 +865,14 @@ def main() -> int:
 
     notifier = TelegramNotifier()
     if args.test_notify:
-        notifier.send("Mean reversion alert bot test: TG push is working. No orders will ever be placed.")
+        try:
+            delivered = notifier.send("Mean reversion alert bot test: TG push is working. No orders will ever be placed.")
+        except requests.RequestException as exc:
+            logger.error("Telegram self-test failed (%s)", type(exc).__name__)
+            return 1
+        if not delivered:
+            logger.error("Telegram self-test failed: message was not delivered")
+            return 1
         return 0
 
     state_path = Path(config.get("state_file", "state/alert_state.json"))
