@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from bot import Signal, VariationalMetadataSource, action_label, build_signal, ratio_side, suggested_operations
+from bot import PriceSnapshot, Signal, VariationalMetadataSource, action_label, build_signal, format_message, ratio_side
 
 
 class BzClSupportTests(unittest.TestCase):
@@ -35,7 +35,7 @@ class BzClSupportTests(unittest.TestCase):
         self.assertEqual(signal.direction, "SHORT_BZ_LONG_CL")
         self.assertEqual(ratio_side(signal.direction), "short_ratio")
 
-    def test_bz_cl_signal_contains_both_manual_operations(self):
+    def test_bz_cl_signal_contains_both_reference_directions(self):
         signal = build_signal(
             {"strategy": "two_way", "pair": "BZ_CL", "z_open": 1.8},
             z=-2.0,
@@ -46,23 +46,21 @@ class BzClSupportTests(unittest.TestCase):
         self.assertIsNotNone(signal)
         self.assertEqual(signal.direction, "LONG_BZ_SHORT_CL")
 
-        operations = suggested_operations(
-            signal,
-            type("Snapshot", (), {"base_price": 91.75, "quote_price": 89.28})(),
-        )
-        self.assertEqual(len(operations), 2)
-        self.assertIn("LONG BZ-PERP", operations[0])
-        self.assertIn("SHORT CL-PERP", operations[1])
+        signal.details.update(reference_mean=1.04, reference_std=0.01)
+        snapshot = PriceSnapshot("BZ", "CL", 91.75, 89.28, 91.75 / 89.28, "variational_metadata", None)
+        message = format_message({"label": "BZ/CL", "z_open": 1.8}, snapshot, -2.0, None, signal)
+        self.assertIn("多 BZ / 空 CL", message)
+        self.assertNotIn("市价", message)
 
-    def test_bz_cl_close_signal_contains_both_manual_operations(self):
-        signal = Signal("CLOSE", "CLOSE_SHORT_BZ_LONG_CL", "", "盈利目标")
-        snapshot = type("Snapshot", (), {"base_price": 91.75, "quote_price": 89.28})()
+    def test_bz_cl_close_signal_identifies_both_legs(self):
+        signal = Signal("CLOSE", "CLOSE_SHORT_BZ_LONG_CL", "", "行情回归",
+                        details={"move_pct": 0.1, "holding_hours": 1})
+        snapshot = PriceSnapshot("BZ", "CL", 91.75, 89.28, 91.75 / 89.28, "variational_metadata", None)
 
         self.assertEqual(action_label(signal), "平空 BZ / 平多 CL")
-        operations = suggested_operations(signal, snapshot)
-        self.assertEqual(len(operations), 2)
-        self.assertIn("回补 BZ-PERP", operations[0])
-        self.assertIn("平 CL-PERP 多单", operations[1])
+        message = format_message({"label": "BZ/CL"}, snapshot, 0, None, signal)
+        self.assertIn("平空 BZ / 平多 CL", message)
+        self.assertNotIn("预估净利", message)
 
 
 if __name__ == "__main__":

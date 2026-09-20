@@ -10,6 +10,7 @@ from bot import PriceSnapshot, Signal, build_close_signal, make_shadow_position
 
 
 CFG = {
+    "label": "BZ/CL",
     "shadow_position_enabled": True,
     "close_on_z_reversion": False,
     "close_profit_ratio_pct": 0.10,
@@ -31,56 +32,40 @@ def bz_cl_snapshot(ratio: float) -> PriceSnapshot:
         None,
         {
             "assets": {
-                "BZ": {"bid": base_price * 0.9998, "ask": base_price * 1.0002},
-                "CL": {"bid": quote_price * 0.9998, "ask": quote_price * 1.0002},
+                "BZ": {"bid": base_price * 0.9998, "ask": base_price * 1.0002, "funding_rate": 0, "funding_interval_s": 3600},
+                "CL": {"bid": quote_price * 0.9998, "ask": quote_price * 1.0002, "funding_rate": 0, "funding_interval_s": 3600},
             }
         },
     )
 
 
-class DynamicCloseCostTests(unittest.TestCase):
-    def test_shadow_position_records_one_way_entry_bbo_cost(self):
+class MarketOnlyCloseTests(unittest.TestCase):
+    def test_signal_tracking_does_not_record_execution_costs(self):
         position = make_shadow_position(
-            CFG,
-            Signal("ENTRY", "SHORT_BZ_LONG_CL", "", "test"),
-            bz_cl_snapshot(1.0),
-            z=2.0,
+            CFG, Signal("ENTRY", "SHORT_BZ_LONG_CL", "", "test"),
+            bz_cl_snapshot(1.03), 2.0, reference_mean=1.0, reference_std=0.01,
         )
+        self.assertNotIn("entry_bbo_cost_pct", position)
+        self.assertNotIn("legs", position)
+        self.assertEqual(position["reference_mean"], 1.0)
 
-        self.assertIn("entry_bbo_cost_pct", position)
-        self.assertAlmostEqual(position["entry_bbo_cost_pct"], 0.04, places=6)
+    def test_partial_reversion_does_not_close_just_because_it_would_be_profitable(self):
+        position = make_shadow_position(
+            CFG, Signal("ENTRY", "SHORT_BZ_LONG_CL", "", ""),
+            bz_cl_snapshot(1.03), 2, reference_mean=1.0, reference_std=0.01,
+        )
+        self.assertIsNone(build_close_signal(CFG, bz_cl_snapshot(1.02), 0, position))
 
-    def test_close_waits_until_net_profit_covers_costs_and_target(self):
-        position = {
-            "direction": "SHORT_BZ_LONG_CL",
-            "ratio_side": "short_ratio",
-            "entry_ratio": 1.0,
-            "entry_bbo_cost_pct": 0.04,
-        }
-
-        signal = build_close_signal(CFG, bz_cl_snapshot(0.9975), z=0.8, position=position)
-
-        self.assertIsNone(signal)
-
-    def test_close_reports_net_profit_after_bbo_costs_and_slippage(self):
-        position = {
-            "direction": "SHORT_BZ_LONG_CL",
-            "ratio_side": "short_ratio",
-            "entry_ratio": 1.0,
-            "entry_bbo_cost_pct": 0.04,
-        }
-
-        signal = build_close_signal(CFG, bz_cl_snapshot(0.996), z=0.8, position=position)
-
+    def test_legacy_cost_settings_do_not_override_market_reversion(self):
+        position = make_shadow_position(
+            CFG, Signal("ENTRY", "SHORT_BZ_LONG_CL", "", ""),
+            bz_cl_snapshot(1.03), 2, reference_mean=1.0, reference_std=0.01,
+        )
+        config = dict(CFG, close_profit_ratio_pct=100, market_slippage_tolerance_pct=100)
+        signal = build_close_signal(config, bz_cl_snapshot(1.003), 2, position)
         self.assertIsNotNone(signal)
-        self.assertIn("entry_bbo_cost_pct", signal.details)
-        self.assertIn("exit_bbo_cost_pct", signal.details)
-        self.assertIn("slippage_tolerance_pct", signal.details)
-        self.assertIn("net_profit_pct", signal.details)
-        self.assertAlmostEqual(signal.details["entry_bbo_cost_pct"], 0.04, places=6)
-        self.assertAlmostEqual(signal.details["exit_bbo_cost_pct"], 0.04, places=6)
-        self.assertAlmostEqual(signal.details["slippage_tolerance_pct"], 0.20, places=6)
-        self.assertAlmostEqual(signal.details["net_profit_pct"], 0.12, places=6)
+        self.assertNotIn("net_profit_pct", signal.details)
+        self.assertIn("reference_z", signal.details)
 
 
 if __name__ == "__main__":
