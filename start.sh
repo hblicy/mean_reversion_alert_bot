@@ -23,7 +23,8 @@ else
   PYTHON_BIN="${PYTHON:-python3}"
 fi
 
-nohup "$PYTHON_BIN" bot.py >>"$LOG_FILE" 2>&1 &
+# bot.py owns alert-bot.log and rotates it; do not keep a second file descriptor open to it.
+nohup "$PYTHON_BIN" bot.py >/dev/null 2>&1 &
 BOT_PID="$!"
 echo "$BOT_PID" > "$PID_FILE"
 

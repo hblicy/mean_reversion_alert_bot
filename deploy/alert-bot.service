@@ -1,0 +1,17 @@
+[Unit]
+Description=Mean reversion alert bot (public market data only)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=alertbot
+WorkingDirectory=/opt/mean_reversion_alert_bot
+EnvironmentFile=-/opt/mean_reversion_alert_bot/.env
+ExecStart=/opt/mean_reversion_alert_bot/.venv/bin/python /opt/mean_reversion_alert_bot/bot.py
+Restart=always
+RestartSec=30
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
