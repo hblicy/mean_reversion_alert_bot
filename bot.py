@@ -539,8 +539,16 @@ def init_monitors(config: dict[str, Any], state: AlertState) -> list[dict[str, A
             item["_prev_z"] = saved.get("prev_z") if saved.get("signature") == signature and saved.get("model") == model else None
             item["_signature"] = signature
             item["_model"] = model
+            pending = state.data.get("pending_entries", {}).get(item["id"])
             if saved.get("model") not in (None, model):
                 state.data.setdefault("pending_entries", {}).pop(item["id"], None)
+            elif pending and "previous_ratio" in pending:
+                if item["method"] != "ratio":
+                    state.data["pending_entries"].pop(item["id"])
+                else:
+                    pending.update(method="ratio", beta=1.0, previous_spread=pending.pop("previous_ratio"),
+                                   direction="short_a_long_b" if ratio_side(pending["direction"]) == "short_ratio" else "long_a_short_b")
+                    logger.info("%s migrated legacy pending ENTRY", item["label"])
             monitors.append(item)
             continue
         sample = state.data.setdefault("samples", {}).get(item["id"], {})
@@ -1043,10 +1051,14 @@ def run_pair(cfg, state, notifier, force=False):
                                                    method=cfg["method"], beta=cfg.get("beta"))
             cfg["_prev_z"], prev_z, pending = None, None, None
         stale = False
-        if quality.get("checked_bucket") != bucket:
+        new_bucket = quality.get("checked_bucket") != bucket
+        if new_bucket or quality.get("stale"):
             for key, value in (("a", snap.base_price), ("b", snap.quote_price)):
                 leg = quality.setdefault(key, {})
-                leg["flat_count"] = leg.get("flat_count", 0) + 1 if leg.get("mid") == value else 1
+                if leg.get("mid") != value:
+                    leg["flat_count"] = 1
+                elif new_bucket:
+                    leg["flat_count"] = leg.get("flat_count", 0) + 1
                 leg["mid"] = value
                 stale |= cfg.get("flat_buckets", 3) > 0 and leg["flat_count"] >= cfg.get("flat_buckets", 3)
             quality["checked_bucket"] = bucket
@@ -1094,7 +1106,7 @@ def run_pair(cfg, state, notifier, force=False):
         return
     z_vol = calc.z_volatility
     if not candidate:
-        if not pending or not 0 <= now.timestamp() - pending["quote_time"] <= cfg.get("max_quote_age_sec", 120):
+        if not pending or not 0 <= utc_now().timestamp() - pending["quote_time"] <= cfg.get("max_quote_age_sec", 120):
             return
         beta = pending["beta"]
         reference = (pending["reference_mean"], pending["reference_std"])

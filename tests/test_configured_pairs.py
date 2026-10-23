@@ -109,6 +109,40 @@ class ConfiguredPairTests(unittest.TestCase):
         self.cycle(101, 110, NOW + timedelta(minutes=80))
         self.assertEqual(self.cfg["_calc"].count, 3)
 
+    def test_flat_recovery_can_close_in_the_same_bucket(self):
+        self.cfg = self.init(dict(CFG, method="ratio", flat_buckets=3))
+        self.state.set_shadow_position("custom", {
+            "direction": "short_a_long_b", "ratio_side": "short_ratio", "method": "ratio", "beta": 1.,
+            "entry_ratio": 1.1, "entry_spread": 1.1, "entry_time": NOW.isoformat(),
+            "reference_mean": 1., "reference_std": .01, "reference_z_close": .5})
+        for i, b in enumerate((101, 102, 103)):
+            self.cycle(110, b, NOW + timedelta(minutes=10 * i))
+        self.assertEqual(self.cfg["_status"], "STALE")
+        self.assertEqual(self.cfg["_calc"].count, 2)
+        self.notifier.send.assert_not_called()
+        self.cycle(100, 100, NOW + timedelta(minutes=20, seconds=30))
+        self.assertIsNone(self.state.shadow_position("custom"))
+        self.assertEqual(self.notifier.send.call_count, 1)
+        self.assertIn("固定均值", self.notifier.send.call_args.args[0])
+        self.assertEqual(self.cfg["_calc"].count, 3)
+        self.cycle(100, 100, NOW + timedelta(minutes=20, seconds=60))
+        self.assertEqual(self.notifier.send.call_count, 1)
+
+    def test_flat_recovery_rechecks_both_legs_without_counting_polls(self):
+        self.cfg["flat_buckets"] = 3
+        for i in range(3):
+            self.cycle(100, 100, NOW + timedelta(minutes=10 * i))
+        for seconds in (30, 60, 90):
+            self.cycle(101, 100, NOW + timedelta(minutes=20, seconds=seconds))
+        self.assertEqual(self.cfg["_status"], "STALE")
+        self.assertEqual(self.cfg["_calc"].count, 2)
+        self.assertEqual(self.state.data["quality"]["custom"]["a"]["flat_count"], 1)
+        self.assertEqual(self.state.data["quality"]["custom"]["b"]["flat_count"], 3)
+        self.cycle(101, 101, NOW + timedelta(minutes=20, seconds=120))
+        self.assertEqual(self.cfg["_status"], "OPEN")
+        self.assertEqual(self.cfg["_calc"].count, 3)
+        self.notifier.send.assert_not_called()
+
     def test_frozen_method_beta_reference_survives_config_change_and_restart(self):
         self.warm()
         self.cycle(110, now=NOW + timedelta(minutes=30))
@@ -209,6 +243,58 @@ class ConfiguredPairTests(unittest.TestCase):
         self.assertEqual(self.cfg["_calc"].count, 3)
         self.cycle(100)
         self.assertIsNone(self.state.shadow_position("custom"))
+
+    def test_legacy_pending_ratio_retries_both_directions_across_restart(self):
+        for old_direction, direction, previous_ratio, current_ratio in (
+                ("SHORT_BZ_LONG_CL", "short_a_long_b", 1.11, 1.09),
+                ("LONG_BZ_SHORT_CL", "long_a_short_b", .89, .91)):
+            with self.subTest(direction=old_direction):
+                self.state.data = {"alerts": {}, "history": {"custom": [.99, 1., 1.01]},
+                    "samples": {"custom": {"interval": 600, "bucket": int(NOW.timestamp() // 600),
+                                           "timestamps": [NOW.timestamp()] * 2}},
+                    "pending_entries": {"custom": {"direction": old_direction, "quote_time": NOW.timestamp(),
+                        "prev_z": (previous_ratio - 1) / .01, "z_vol": None, "previous_ratio": previous_ratio,
+                        "reference_mean": 1., "reference_std": .01}}}
+                self.state.save()
+                self.state = bot.AlertState(self.state.path)
+                cfg = dict(CFG, method="ratio", entry_require_cross=True)
+                self.cfg = self.init(cfg)
+                self.notifier.send.reset_mock()
+                self.notifier.send.side_effect = [False, True]
+                self.cycle(current_ratio * 100, now=NOW + timedelta(seconds=30))
+                self.assertIsNone(self.state.shadow_position("custom"))
+                pending = self.state.data["pending_entries"]["custom"]
+                self.assertEqual(pending["direction"], direction)
+                self.assertEqual(pending["quote_time"], NOW.timestamp())
+                self.state = bot.AlertState(self.state.path)
+                self.cfg = self.init(cfg)
+                self.cycle(current_ratio * 100, now=NOW + timedelta(seconds=60))
+                self.assertEqual(self.notifier.send.call_count, 2)
+                position = self.state.shadow_position("custom")
+                self.assertEqual(position["direction"], direction)
+                self.assertEqual((position["method"], position["beta"]), ("ratio", 1.))
+                self.assertEqual((position["reference_mean"], position["reference_std"]), (1., .01))
+                self.assertNotIn("custom", self.state.data["pending_entries"])
+                self.assertEqual(len(self.state.history("custom")), 3)
+
+    def test_legacy_pending_ratio_expiry_is_not_extended_by_migration(self):
+        self.state.data["pending_entries"] = {"custom": {
+            "direction": "SHORT_BZ_LONG_CL", "quote_time": NOW.timestamp(), "prev_z": 11.,
+            "z_vol": None, "previous_ratio": 1.11, "reference_mean": 1., "reference_std": .01}}
+        self.state.data["samples"] = {"custom": {
+            "interval": 600, "bucket": int(NOW.timestamp() // 600), "timestamps": [NOW.timestamp()] * 2}}
+        self.state.set_history("custom", [.99, 1., 1.01])
+        self.cfg = self.init(dict(CFG, method="ratio"))
+        self.cycle(109, now=NOW + timedelta(seconds=121))
+        self.notifier.send.assert_not_called()
+        self.assertNotIn("custom", self.state.data["pending_entries"])
+
+    def test_legacy_pending_ratio_is_cancelled_when_method_changes(self):
+        self.state.data["pending_entries"] = {"custom": {
+            "direction": "SHORT_BZ_LONG_CL", "quote_time": NOW.timestamp(), "prev_z": 11.,
+            "z_vol": None, "previous_ratio": 1.11, "reference_mean": 1., "reference_std": .01}}
+        self.cfg = self.init(CFG)
+        self.assertNotIn("custom", self.state.data["pending_entries"])
 
     def test_holding_clock_pauses_during_observed_no_quote(self):
         self.warm()
@@ -441,6 +527,39 @@ class ConfiguredPairTests(unittest.TestCase):
         self.cycle(109.8, now=entered_at + timedelta(seconds=150))
         self.assertEqual(self.notifier.send.call_count, 1)
         self.assertNotIn("custom", self.state.data["pending_entries"])
+
+    def test_pending_entry_expires_while_fetching_fresh_quotes(self):
+        self.warm()
+        self.notifier.send.side_effect = [False, True]
+        entered_at = NOW + timedelta(minutes=30)
+        self.cycle(110, now=entered_at)
+        self.clock.return_value = entered_at + timedelta(seconds=115)
+
+        def slow_snapshot(*args):
+            self.clock.return_value = entered_at + timedelta(seconds=127)
+            return quote(109.8, now=self.clock.return_value)
+
+        self.source.snapshot.side_effect = slow_snapshot
+        bot.run_once([self.cfg], self.state, self.notifier)
+        self.assertEqual(self.notifier.send.call_count, 1)
+        self.assertNotIn("custom", self.state.data["pending_entries"])
+        self.assertIsNone(self.state.shadow_position("custom"))
+
+    def test_pending_entry_retries_when_slow_fetch_finishes_before_deadline(self):
+        self.warm()
+        self.notifier.send.side_effect = [False, True]
+        entered_at = NOW + timedelta(minutes=30)
+        self.cycle(110, now=entered_at)
+        self.clock.return_value = entered_at + timedelta(seconds=100)
+
+        def slow_snapshot(*args):
+            self.clock.return_value = entered_at + timedelta(seconds=112)
+            return quote(109.8, now=self.clock.return_value)
+
+        self.source.snapshot.side_effect = slow_snapshot
+        bot.run_once([self.cfg], self.state, self.notifier)
+        self.assertEqual(self.notifier.send.call_count, 2)
+        self.assertIsNotNone(self.state.shadow_position("custom"))
 
     def test_invalid_quote_still_cancels_pending_entry(self):
         self.warm()
