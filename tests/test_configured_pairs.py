@@ -298,6 +298,111 @@ class ConfiguredPairTests(unittest.TestCase):
         self.assertIsNone(self.state.shadow_position("custom"))
         self.source.snapshot.assert_not_called()
 
+    def test_same_bucket_update_closes_on_risk_using_prior_window(self):
+        self.cfg = self.init(dict(CFG, method="ratio", entry_max_z=4))
+        self.cfg["_calc"] = bot.SpreadCalculator(3, method="ratio", history=[.99, 1., 1.01])
+        self.state.set_shadow_position("custom", {
+            "direction": "short_a_long_b", "ratio_side": "short_ratio", "method": "ratio", "beta": 1.,
+            "entry_ratio": 1.02, "entry_spread": 1.02, "entry_time": NOW.isoformat(),
+            "reference_mean": 1., "reference_std": .01, "reference_z_close": .5})
+        self.cycle(103)
+        self.notifier.send.assert_not_called()
+        self.cycle(105, now=NOW + timedelta(seconds=30))
+        self.assertIsNone(self.state.shadow_position("custom"))
+        self.assertEqual(self.notifier.send.call_count, 1)
+        self.assertIn("风险提醒", self.notifier.send.call_args.args[0])
+        self.assertIn("+5.000", self.notifier.send.call_args.args[0])
+
+    def test_same_bucket_risk_reference_survives_restart(self):
+        cfg = dict(CFG, method="ratio", entry_max_z=4)
+        self.cfg = self.init(cfg)
+        self.cfg["_calc"] = bot.SpreadCalculator(3, method="ratio", history=[.99, 1., 1.01])
+        self.state.set_shadow_position("custom", {
+            "direction": "short_a_long_b", "ratio_side": "short_ratio", "method": "ratio", "beta": 1.,
+            "entry_ratio": 1.02, "entry_spread": 1.02, "entry_time": NOW.isoformat(),
+            "reference_mean": 1., "reference_std": .01, "reference_z_close": .5})
+        self.cycle(103)
+        self.state = bot.AlertState(self.state.path)
+        self.cfg = self.init(cfg)
+        self.cycle(105, now=NOW + timedelta(seconds=30))
+        self.assertIsNone(self.state.shadow_position("custom"))
+        self.assertEqual(self.notifier.send.call_count, 1)
+
+    def test_restart_discards_persisted_session_override(self):
+        sunday = datetime(2026, 10, 25, 22, tzinfo=timezone.utc)
+        tuesday = datetime(2026, 10, 27, 20, tzinfo=timezone.utc)
+        for was_open in (True, False):
+            with self.subTest(was_open=was_open):
+                self.state.set_shadow_position("custom", {
+                    "direction": "short_a_long_b", "ratio_side": "short_ratio", "method": "beta_spread", "beta": .5,
+                    "entry_ratio": 1., "entry_spread": math.log(100) * .5, "entry_time": sunday.isoformat(),
+                    "clock_time": sunday.isoformat(), "trading_seconds": 0.,
+                    "clock_open": was_open, "clock_override": True})
+                self.state.save()
+                self.state = bot.AlertState(self.state.path)
+                self.cfg = self.init(CFG)
+                self.cycle(100, now=tuesday)
+                position = self.state.shadow_position("custom")
+                self.assertIsNotNone(position)
+                self.assertEqual(position["trading_seconds"], 39 * 3600)
+        self.notifier.send.assert_not_called()
+
+    def test_live_session_override_counts_only_observed_short_intervals(self):
+        sunday = datetime(2026, 10, 25, 22, tzinfo=timezone.utc)
+        self.state.set_shadow_position("custom", {
+            "direction": "short_a_long_b", "ratio_side": "short_ratio", "method": "beta_spread", "beta": .5,
+            "entry_ratio": 1., "entry_spread": math.log(100) * .5, "entry_time": sunday.isoformat()})
+        self.cycle(100, now=sunday)
+        self.cycle(100, now=sunday + timedelta(seconds=30))
+        self.assertEqual(self.state.shadow_position("custom")["trading_seconds"], 30)
+        self.cycle(100, now=datetime(2026, 10, 27, 20, tzinfo=timezone.utc))
+        self.assertIsNotNone(self.state.shadow_position("custom"))
+        self.assertEqual(self.state.shadow_position("custom")["trading_seconds"], 39 * 3600 + 30)
+
+    def test_legacy_close_cooldown_blocks_generic_entry(self):
+        cfg = dict(CFG, method="ratio", cooldown_sec=1800)
+        self.cfg = self.init(cfg)
+        self.cfg["_calc"] = bot.SpreadCalculator(3, method="ratio", history=[.99, 1., 1.01])
+        self.state.set_shadow_position("custom", {
+            "direction": "SHORT_BZ_LONG_CL", "ratio_side": "short_ratio", "entry_ratio": 1.1,
+            "entry_time": NOW.isoformat(), "reference_mean": 1., "reference_std": .01, "reference_z_close": .5})
+        with patch("bot.time.time", side_effect=lambda: self.clock.return_value.timestamp()):
+            self.cycle(100)
+            self.assertIsNone(self.state.shadow_position("custom"))
+            self.cycle(110, now=NOW + timedelta(minutes=10))
+            self.cycle(108, now=NOW + timedelta(minutes=20))
+            self.assertEqual(self.notifier.send.call_count, 1)
+            self.cycle(130, now=NOW + timedelta(minutes=31))
+            self.assertEqual(self.notifier.send.call_count, 2)
+
+    def test_legacy_timeout_cooldown_blocks_generic_entry(self):
+        cfg = copy.deepcopy(CFG)
+        cfg.update(method="ratio", max_holding_hours=72, cooldown_sec=1800)
+        for leg in cfg["legs"].values():
+            leg.update(session="always", contract_type="perpetual")
+            leg["ticker"] = leg["ticker"].removesuffix("-SWAP") + "-PERP"
+        self.cfg = self.init(cfg)
+        self.cfg["_calc"] = bot.SpreadCalculator(3, method="ratio", history=[.99, 1., 1.01])
+        self.state.set_shadow_position("custom", {
+            "direction": "SHORT_BZ_LONG_CL", "ratio_side": "short_ratio", "entry_ratio": 1.1,
+            "entry_time": (NOW - timedelta(hours=73)).isoformat()})
+        with patch("bot.time.time", side_effect=lambda: self.clock.return_value.timestamp()):
+            self.cycle(100)
+            self.cycle(110, now=NOW + timedelta(minutes=10))
+            self.assertEqual(self.notifier.send.call_count, 1)
+
+    def test_existing_legacy_cooldowns_migrate_without_shortening_newer_keys(self):
+        old_key = "custom:SHORT_BZ_LONG_CL:ENTRY"
+        new_key = "custom:short_a_long_b:ENTRY"
+        self.state.data["alerts"] = {old_key: NOW.timestamp()}
+        self.cfg = self.init(CFG)
+        self.assertEqual(self.state.data["alerts"].get(new_key), NOW.timestamp())
+        self.assertEqual(self.state.data["alerts"][old_key], NOW.timestamp())
+        newer = NOW.timestamp() + 60
+        self.state.data["alerts"][new_key] = newer
+        self.cfg = self.init(CFG)
+        self.assertEqual(self.state.data["alerts"][new_key], newer)
+
 
 class ConfigValidationTests(unittest.TestCase):
     def test_wrong_contract_and_spy_swap_leg_rejected(self):

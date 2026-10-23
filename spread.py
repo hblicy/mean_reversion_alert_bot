@@ -23,7 +23,8 @@ class SpreadCalculator:
         self.window_size = window_size
         self.method = method
         self.beta = beta or {"mode": "fixed", "value": 1.0}
-        capacity = max(window_size, int(self.beta.get("rolling_buckets", 0)) + 1)
+        # Retain the current bucket as well as the complete preceding reference.
+        capacity = max(window_size + 1, int(self.beta.get("rolling_buckets", 0)) + 2)
         self.history = deque((history or [])[-capacity:], maxlen=capacity)
         self.z_history = deque((z_history or [])[-z_vol_window:], maxlen=z_vol_window)
 
@@ -35,14 +36,18 @@ class SpreadCalculator:
     def z_volatility(self):
         return stdev(self.z_history) if len(self.z_history) >= 10 else None
 
-    def current_beta(self):
+    def _prior_rows(self, bucket):
+        return [row for row in self.history
+                if bucket is None or not isinstance(row, dict) or row["bucket"] < bucket]
+
+    def current_beta(self, bucket=None):
         if self.method != "beta_spread":
             return 1.0
         fallback = float(self.beta["value"])
         if self.beta["mode"] == "fixed":
             return fallback
         size = int(self.beta["rolling_buckets"])
-        rows = list(self.history)[-(size + 1):]
+        rows = self._prior_rows(bucket)[-(size + 1):]
         if len(rows) < size + 1 or any(not isinstance(row, dict) for row in rows):
             return fallback
         returns_a = [log(y["a_mid"] / x["a_mid"]) for x, y in zip(rows, rows[1:])]
@@ -54,15 +59,15 @@ class SpreadCalculator:
         slope = sum((a - a_mean) * (b - b_mean) for a, b in zip(returns_a, returns_b)) / variance
         return max(float(self.beta["min"]), min(float(self.beta["max"]), slope))
 
-    def values(self, beta):
+    def values(self, beta, bucket=None):
         return [spread_value(row["a_mid"], row["b_mid"], self.method, beta)
                 if isinstance(row, dict) else float(row)
-                for row in list(self.history)[-self.window_size:]]
+                for row in self._prior_rows(bucket)[-self.window_size:]]
 
-    def evaluate(self, a, b, beta=None):
-        beta = self.current_beta() if beta is None else beta
+    def evaluate(self, a, b, beta=None, *, bucket=None):
+        beta = self.current_beta(bucket) if beta is None else beta
         value = spread_value(a, b, self.method, beta)
-        values = self.values(beta)
+        values = self.values(beta, bucket)
         reference = (mean(values), stdev(values)) if len(values) >= self.window_size else None
         z = None
         if reference:
@@ -71,7 +76,7 @@ class SpreadCalculator:
         return z, reference, beta
 
     def add(self, row):
-        result = self.evaluate(row["a_mid"], row["b_mid"])
+        result = self.evaluate(row["a_mid"], row["b_mid"], bucket=row["bucket"])
         self.history.append(row)
         if result[0] is not None:
             self.z_history.append(result[0])

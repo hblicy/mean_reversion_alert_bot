@@ -82,6 +82,19 @@ class SpreadTests(unittest.TestCase):
         self.assertEqual(reference, (2, 1))
         self.assertEqual(z, 3)
 
+    def test_same_bucket_beta_excludes_current_returns_after_restart(self):
+        beta = {"mode": "rolling_return_ols", "value": .5, "rolling_buckets": 3, "min": .3, "max": 1}
+        calc = SpreadCalculator(3, method="beta_spread", beta=beta)
+        for i, value in enumerate((0, .1, .3, .4)):
+            calc.add({"bucket": i, "ts": i, "a_mid": math.exp(value), "b_mid": math.exp(value)})
+        a, b = math.exp(.8), math.exp(.5)
+        _, reference, used = calc.add({"bucket": 4, "ts": 4, "a_mid": a, "b_mid": b})
+        _, repeated_reference, repeated_beta = calc.evaluate(a, b, bucket=4)
+        self.assertEqual(repeated_beta, used)
+        self.assertEqual(repeated_reference, reference)
+        restarted = SpreadCalculator(3, method="beta_spread", beta=beta, history=calc.dump_history())
+        self.assertEqual(restarted.evaluate(a, b, bucket=4)[2], used)
+
 
 if __name__ == "__main__":
     unittest.main()

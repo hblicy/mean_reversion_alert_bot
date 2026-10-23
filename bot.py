@@ -503,6 +503,15 @@ def init_monitors(config: dict[str, Any], state: AlertState) -> list[dict[str, A
         item["_source"] = sources[source_name]
         item["_calendar"] = calendar
         if "legs" in item:
+            alerts = state.data.setdefault("alerts", {})
+            prefix = f"{item['id']}:"
+            for key, sent_at in list(alerts.items()):
+                if key.startswith(prefix) and key.endswith(":ENTRY"):
+                    direction = key[len(prefix):-len(":ENTRY")]
+                    if ratio_side(direction):
+                        normalized = entry_cooldown_key(item, direction)
+                        if normalized != key:
+                            alerts[normalized] = max(float(sent_at), float(alerts.get(normalized, 0)))
             saved = state.data.get("statistics", {}).get(item["id"], {})
             history = state.history(item["id"])
             signature = [item.get("sample_interval_sec", 600),
@@ -699,6 +708,12 @@ def ratio_side(direction: str) -> str:
     return ""
 
 
+def entry_cooldown_key(cfg, direction):
+    if "legs" in cfg:
+        direction = {"short_ratio": "short_a_long_b", "long_ratio": "long_a_short_b"}[ratio_side(direction)]
+    return f"{cfg['id']}:{direction}:ENTRY"
+
+
 def favorable_ratio_move_pct(position: dict[str, Any], current_ratio: float) -> float:
     entry_ratio = float(position.get("entry_ratio", 0) or 0)
     if entry_ratio <= 0:
@@ -828,7 +843,7 @@ def send_timeout(cfg: dict[str, Any], position: dict[str, Any], state: AlertStat
                "信号时间不代表你的实际开仓时间；机器人不会下单。")
     if notifier.send(message):
         state.clear_shadow_position(cfg["id"])
-        state.mark_sent(f"{cfg['id']}:{position['direction']}:ENTRY")
+        state.mark_sent(entry_cooldown_key(cfg, position["direction"]))
         state.save()
     else:
         logger.warning("%s timeout notification not delivered; retaining position for retry", cfg["label"])
@@ -847,9 +862,16 @@ def pair_trading_hours(cfg, position, now):
 def advance_pair_clock(cfg, position, now):
     previous = parse_timestamp(position.get("clock_time", position["entry_time"]))
     seconds = position.get("trading_seconds", 0.0)
-    if position.get("clock_open", True):
-        seconds += (now - previous).total_seconds() if position.get("clock_override") else cfg["_calendar"].open_seconds(cfg["legs"], previous, now)
-    position.update(trading_seconds=max(0.0, seconds), clock_time=now.isoformat(), clock_open=False)
+    elapsed = (now - previous).total_seconds()
+    if cfg.get("_clock_open", True):
+        # Quote-based session overrides expire with live observations, not across restarts or long pauses.
+        if cfg.get("_clock_override") and 0 <= elapsed <= cfg.get("max_quote_age_sec", 120):
+            seconds += elapsed
+        else:
+            seconds += cfg["_calendar"].open_seconds(cfg["legs"], previous, now)
+    position.update(trading_seconds=max(0.0, seconds), clock_time=now.isoformat())
+    cfg["_clock_open"] = False
+    cfg["_clock_override"] = False
 
 
 def pair_close_signal(cfg, snap, position, z):
@@ -1034,11 +1056,12 @@ def run_pair(cfg, state, notifier, force=False):
         return
     cfg["_last_valid_quote"] = min(timestamps)
     if position:
-        position.update(clock_open=True, clock_override=not scheduled_open)
+        cfg["_clock_open"] = True
+        cfg["_clock_override"] = not scheduled_open
         state.set_shadow_position(ident, position)
     if candidate:
-        beta = calc.current_beta()
-        values = calc.values(beta)
+        beta = calc.current_beta(bucket)
+        values = calc.values(beta, bucket)
         previous_spread = values[-1] if values else None
         z, reference, beta = calc.add({"bucket": bucket, "ts": min(timestamps), "a_mid": snap.base_price, "b_mid": snap.quote_price})
         state.data["samples"][ident] = {"interval": interval, "bucket": bucket, "timestamps": timestamps}
@@ -1049,7 +1072,7 @@ def run_pair(cfg, state, notifier, force=False):
         grace = quality.get("grace", 0) > 0
         quality["grace"] = max(0, quality.get("grace", 0) - 1)
     else:
-        z, reference, beta = calc.evaluate(snap.base_price, snap.quote_price)
+        z, reference, beta = calc.evaluate(snap.base_price, snap.quote_price, bucket=bucket)
         previous_spread, grace = None, quality.get("grace", 0) > 0
     ages = " / ".join(f"{now.timestamp() - t:.0f}s" for t in timestamps)
     pair_summary(cfg, "OPEN", ages)
@@ -1061,7 +1084,7 @@ def run_pair(cfg, state, notifier, force=False):
         elif force or state.should_send(key, cfg.get("close_cooldown_sec", 300)):
             if notifier.send(format_pair_message(cfg, snap, z, close)):
                 state.mark_sent(key)
-                state.mark_sent(f"{ident}:{position['direction']}:ENTRY")
+                state.mark_sent(entry_cooldown_key(cfg, position["direction"]))
                 state.clear_shadow_position(ident)
         return
     if position or grace:
@@ -1088,7 +1111,7 @@ def run_pair(cfg, state, notifier, force=False):
     if cfg.get("shadow_mode"):
         logger.info("SHADOW %s", format_pair_message(cfg, snap, z, signal))
         return
-    key = f"{ident}:{signal.direction}:ENTRY"
+    key = entry_cooldown_key(cfg, signal.direction)
     if not force and not state.should_send(key, cfg.get("cooldown_sec", 1800)):
         return
     pending_entries[ident] = {**signal.details, "direction": signal.direction,
@@ -1103,8 +1126,9 @@ def run_pair(cfg, state, notifier, force=False):
                 **signal.details, "direction": signal.direction, "ratio_side": ratio_side(signal.direction),
                 "entry_spread": current, "entry_ratio": snap.ratio, "entry_z": z,
                 "reference_z_close": cfg.get("z_close", .35), "entry_time": utc_now().isoformat(),
-                "trading_seconds": 0.0, "clock_time": utc_now().isoformat(), "clock_open": True,
-                "clock_override": not scheduled_open})
+                "trading_seconds": 0.0, "clock_time": utc_now().isoformat()})
+            cfg["_clock_open"] = True
+            cfg["_clock_override"] = not scheduled_open
         state.save()
 
 
