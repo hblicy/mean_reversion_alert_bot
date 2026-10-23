@@ -118,6 +118,28 @@ class V2SourceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, expected):
                     bot.init_monitors({"pairs": [copy.deepcopy(CFG)]}, state)
 
+    def test_request_failures_and_backoff_remain_distinct_from_invalid_quotes(self):
+        for kind in ("timeout", "429", "503"):
+            with self.subTest(kind=kind):
+                source, session = self.source()
+                if kind == "timeout":
+                    session.get.side_effect = bot.requests.Timeout("offline")
+                else:
+                    session.get.return_value.status_code = int(kind)
+                    if kind == "429":
+                        session.get.return_value.json.return_value = {"retry_after_seconds": 30}
+                with patch("bot.time.monotonic", return_value=100):
+                    with self.assertRaises(bot.MarketDataError) as failure:
+                        source.get_leg("US30-SWAP", "size_1k")
+                    self.assertIsInstance(failure.exception, bot.MarketDataUnavailable)
+                    with self.assertRaises(bot.MarketDataUnavailable):
+                        source.get_leg("US30-SWAP", "size_1k")
+                with patch("bot.time.monotonic", return_value=110):
+                    source.begin_cycle()
+                    with self.assertRaises(bot.MarketDataUnavailable):
+                        source.get_leg("US30-SWAP", "size_1k")
+                self.assertEqual(session.get.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

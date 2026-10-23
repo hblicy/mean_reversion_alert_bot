@@ -403,6 +403,75 @@ class ConfiguredPairTests(unittest.TestCase):
         self.cfg = self.init(CFG)
         self.assertEqual(self.state.data["alerts"][new_key], newer)
 
+    def test_pending_entry_survives_transient_fetch_failure_and_restart(self):
+        self.warm()
+        self.notifier.send.side_effect = [False, True]
+        entered_at = NOW + timedelta(minutes=30)
+        self.cycle(110, now=entered_at)
+        session = Mock()
+        session.get.side_effect = bot.requests.Timeout("offline")
+        request_source = bot.VariationalV2Source(session)
+        with self.assertRaises(bot.MarketDataError) as failure:
+            request_source.get_leg("US30-SWAP", "size_1k")
+        self.clock.return_value = entered_at + timedelta(seconds=30)
+        self.source.snapshot.side_effect = failure.exception
+        bot.run_once([self.cfg], self.state, self.notifier)
+        self.assertIn("custom", self.state.data["pending_entries"])
+        self.state = bot.AlertState(self.state.path)
+        self.cfg = self.init(CFG)
+        self.source.snapshot.side_effect = None
+        self.cycle(109.8, now=entered_at + timedelta(seconds=60))
+        self.assertEqual(self.notifier.send.call_count, 2)
+        self.assertIsNotNone(self.state.shadow_position("custom"))
+
+    def test_fetch_recovery_cannot_extend_pending_entry_deadline(self):
+        self.warm()
+        self.notifier.send.return_value = False
+        entered_at = NOW + timedelta(minutes=30)
+        self.cycle(110, now=entered_at)
+        session = Mock()
+        session.get.side_effect = bot.requests.Timeout("offline")
+        request_source = bot.VariationalV2Source(session)
+        with self.assertRaises(bot.MarketDataError) as failure:
+            request_source.get_leg("US30-SWAP", "size_1k")
+        self.clock.return_value = entered_at + timedelta(seconds=30)
+        self.source.snapshot.side_effect = failure.exception
+        bot.run_once([self.cfg], self.state, self.notifier)
+        self.source.snapshot.side_effect = None
+        self.cycle(109.8, now=entered_at + timedelta(seconds=150))
+        self.assertEqual(self.notifier.send.call_count, 1)
+        self.assertNotIn("custom", self.state.data["pending_entries"])
+
+    def test_invalid_quote_still_cancels_pending_entry(self):
+        self.warm()
+        self.notifier.send.return_value = False
+        entered_at = NOW + timedelta(minutes=30)
+        self.cycle(110, now=entered_at)
+        self.clock.return_value = entered_at + timedelta(seconds=30)
+        self.source.snapshot.side_effect = bot.MarketDataError("US30-SWAP: invalid BBO")
+        bot.run_once([self.cfg], self.state, self.notifier)
+        self.assertNotIn("custom", self.state.data["pending_entries"])
+        self.source.snapshot.side_effect = None
+        self.cycle(109.8, now=entered_at + timedelta(seconds=60))
+        self.assertEqual(self.notifier.send.call_count, 1)
+
+    def test_sunday_continuous_quotes_timeout_has_no_deferred_note(self):
+        sunday = datetime(2026, 10, 25, 22, 30, tzinfo=timezone.utc)
+        self.state.set_shadow_position("custom", {
+            "direction": "short_a_long_b", "ratio_side": "short_ratio", "method": "beta_spread", "beta": .5,
+            "entry_ratio": 1., "entry_spread": math.log(100) * .5,
+            "entry_time": datetime(2026, 10, 21, 22, 30, tzinfo=timezone.utc).isoformat(),
+            "clock_time": sunday.isoformat(), "trading_seconds": 46 * 3600 - 30})
+        self.cycle(100, now=sunday)
+        self.notifier.send.assert_not_called()
+        self.cycle(100, now=sunday + timedelta(seconds=30))
+        self.assertIsNone(self.state.shadow_position("custom"))
+        self.assertEqual(self.notifier.send.call_count, 1)
+        self.assertIn("超时", self.notifier.send.call_args.args[0])
+        self.assertNotIn("休市期间到期，开市后补发", self.notifier.send.call_args.args[0])
+        self.cycle(100, now=sunday + timedelta(seconds=60))
+        self.assertEqual(self.notifier.send.call_count, 1)
+
 
 class ConfigValidationTests(unittest.TestCase):
     def test_wrong_contract_and_spy_swap_leg_rejected(self):

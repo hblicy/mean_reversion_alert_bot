@@ -41,6 +41,10 @@ class MarketDataError(ValueError):
     pass
 
 
+class MarketDataUnavailable(MarketDataError):
+    pass
+
+
 @dataclass
 class LegQuote:
     ticker: str
@@ -345,12 +349,12 @@ class VariationalV2Source(HttpSource):
 
     def _stats(self):
         if self._cycle_error:
-            raise MarketDataError(self._cycle_error)
+            raise MarketDataUnavailable(self._cycle_error)
         if self._listings is not None:
             return self._listings
         now = time.monotonic()
         if now < self.retry_at:
-            raise MarketDataError(f"Variational backoff: retry in {self.retry_at - now:.0f}s")
+            raise MarketDataUnavailable(f"Variational backoff: retry in {self.retry_at - now:.0f}s")
         try:
             response = self.session.get(self.url, timeout=self.timeout,
                                         headers={"User-Agent": "mean-reversion-alert-bot/2.0"})
@@ -377,7 +381,7 @@ class VariationalV2Source(HttpSource):
                 delay = min(30 * 2 ** min(self.failures - 1, 4), 300)
                 self.retry_at = now + delay
                 self._cycle_error = f"Variational fetch failed ({type(exc).__name__}); retry in {delay}s"
-            raise MarketDataError(self._cycle_error) from None
+            raise MarketDataUnavailable(self._cycle_error) from None
         self.failures = 0
         self._listings = {row["ticker"]: row for row in rows}
         return self._listings
@@ -984,9 +988,6 @@ def run_pair(cfg, state, notifier, force=False):
         state.set_shadow_position(ident, position)
         hours = pair_trading_hours(cfg, position, now)
         limit = cfg.get("max_holding_hours", 72) if all(leg["session"] == "always" for leg in cfg["legs"].values()) else cfg.get("max_holding_trading_hours", 46)
-        if hours >= limit and not scheduled_open:
-            position["deferred_close"] = True
-            state.set_shadow_position(ident, position)
         if all(leg["session"] == "always" for leg in cfg["legs"].values()) and hours >= limit:
             if cfg.get("shadow_mode"):
                 logger.info("SHADOW %s timeout due after %.2f wall-clock hours", cfg["label"], hours)
@@ -995,6 +996,8 @@ def run_pair(cfg, state, notifier, force=False):
             return
     try:
         snap = cfg["_source"].snapshot(cfg.get("pair", ident), cfg)
+    except MarketDataUnavailable:
+        raise
     except MarketDataError as exc:
         pending_entries.pop(ident, None)
         if str(exc) == "CLOSED_OR_NO_QUOTE":
