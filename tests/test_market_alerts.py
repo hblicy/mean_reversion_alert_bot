@@ -124,7 +124,10 @@ class MarketAlertsTests(unittest.TestCase):
     def test_checked_in_config_has_no_execution_cost_parameters(self):
         config = bot.load_config(bot.DEFAULT_CONFIG)
         for pair in config["pairs"]:
-            self.assertEqual(pair["max_holding_hours"], 72)
+            if pair["id"] == "us30_us100_swap":
+                self.assertEqual(pair["max_holding_trading_hours"], 46)
+            else:
+                self.assertEqual(pair["max_holding_hours"], 72)
             for field in ("position_size_usd", "market_slippage_tolerance_pct", "close_profit_ratio_pct", "close_on_z_reversion"):
                 self.assertNotIn(field, pair)
 
