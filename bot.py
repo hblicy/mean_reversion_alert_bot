@@ -896,9 +896,13 @@ def pair_close_signal(cfg, snap, position, z):
     sign = 1 if side == "short_ratio" else -1
     move = (entry - current) * sign
     move_bps = move / entry * 10000 if method == "ratio" else move * 10000
-    hours = pair_trading_hours(cfg, position, utc_now())
+    now = utc_now()
+    start = parse_timestamp(position["entry_time"])
+    hours = pair_trading_hours(cfg, position, now)
     details = {"move_bps": move_bps, "holding_hours": hours, "method": method, "beta": beta,
-               "spread": current, "deferred": position.get("deferred_close", False)}
+               "spread": current, "deferred": position.get("deferred_close", False),
+               "entry_time": position["entry_time"], "wall_hours": (now - start).total_seconds() / 3600,
+               "scheduled_hours": cfg["_calendar"].open_seconds(cfg["legs"], start, now) / 3600}
     reasons = []
     limit = cfg.get("max_holding_hours", 72) if all(leg["session"] == "always" for leg in cfg["legs"].values()) else cfg.get("max_holding_trading_hours", 46)
     if hours >= limit:
@@ -926,8 +930,11 @@ def format_pair_message(cfg, snap, z, signal):
     tier = " ·观察级·弱相关" if cfg.get("tier") == "observe" else ""
     beta = details.get("beta", 1.0)
     method = details.get("method", cfg["method"])
+    a, b = (cfg["legs"][key]["name"] for key in ("a", "b"))
+    always = all(leg["session"] == "always" for leg in cfg["legs"].values())
+    pause_note = "" if always else "（休市及无有效行情时暂停）"
     lines = [f"{'🔵' if closing else '🟢'} [{signal.level}] {cfg['label']} {'结束跟踪' if closing else '偏离'}提醒{tier}",
-             f"方向参考：{signal.action}（建议名义比 1 : {beta:.2f}，按 β；仅参考）",
+             f"方向参考：{signal.action}（模型名义比 {a}:{b} = 1 : {beta:.2f}，按名义价值；仅参考）",
              f"方法：{method} β={beta:.2f}｜窗口 {cfg['window_buckets']} 桶（每桶 {cfg.get('sample_interval_sec', 600)} 秒）"]
     if z is not None:
         lines.append(f"滚动 Z：{z:+.3f}（阈值 {cfg['z_open']:.2f}）")
@@ -936,7 +943,10 @@ def format_pair_message(cfg, snap, z, signal):
         if "reference_z" in details:
             lines.append(f"相对 ENTRY 固定基准 Z：{details['reference_z']:+.3f}")
         lines.extend([f"信号方向上的价差变化：{details['move_bps']:+.2f} bps（不是持仓收益率）",
-                      f"已跟踪：{details['holding_hours']:.2f} 个{'自然' if all(leg['session'] == 'always' for leg in cfg['legs'].values()) else '交易'}小时"])
+                      f"原始 ENTRY：{parse_timestamp(details['entry_time']).astimezone(BEIJING):%Y-%m-%d %H:%M:%S} 北京时间",
+                      f"信号跟踪计时：{details['holding_hours']:.2f} 个{'自然' if always else '交易'}小时{pause_note}",
+                      f"自然经过：{details['wall_hours']:.2f} 小时｜日程开市：{details['scheduled_hours']:.2f} 小时｜"
+                      f"开市计时差：{details['scheduled_hours'] - details['holding_hours']:+.2f} 小时"])
         if details.get("deferred"):
             lines.append("（休市期间到期，开市后补发）")
     else:
@@ -970,12 +980,34 @@ def format_pair_message(cfg, snap, z, signal):
         lines.append("时段：两腿有有效报价；以接口为准")
     limit = cfg.get("max_holding_hours", 72) if all(leg["session"] == "always" for leg in cfg["legs"].values()) else cfg.get("max_holding_trading_hours", 46)
     lines.extend([f"时间：{utc_now().astimezone(BEIJING):%Y-%m-%d %H:%M:%S} 北京时间；最多跟踪 {limit:g} 个{'自然' if all(leg['session'] == 'always' for leg in cfg['legs'].values()) else '交易'}小时。",
+                  f"跟踪基于原始 ENTRY 信号{pause_note}，不代表你的实际开仓时间或持仓盈亏。",
                   "仅行情提醒，机器人不会下单；请在 Variational 自行核对报价与成本。"])
     return "\n".join(lines)
 
 
-def pair_summary(cfg, status, ages="N/A"):
+def pair_summary(cfg, status, ages="N/A", *, position=None):
     cfg["_status"] = status
+    if position and any(leg["session"] != "always" for leg in cfg["legs"].values()):
+        clock_time = parse_timestamp(position["clock_time"])
+        reason = re.sub(r"(\bage=|\bretry in )[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?s\b",
+                        r"\1#s", status)
+        previous = cfg.get("_clock_log")
+        if previous is None or previous["reason"] != reason:
+            if previous and previous["status"] != "OPEN":
+                logger.info("%s CLOCK_PAUSE_END pair=%s entry_time=%s start=%s end=%s reason=%s "
+                            "paused_seconds=%.3f scheduled_open_seconds=%.3f next_state=%s tracked_seconds=%.3f",
+                            cfg["label"], cfg["id"], position["entry_time"], previous["since"].isoformat(),
+                            clock_time.isoformat(), previous["status"],
+                            (clock_time - previous["since"]).total_seconds(),
+                            cfg["_calendar"].open_seconds(cfg["legs"], previous["since"], clock_time),
+                            status, position["trading_seconds"])
+            if status != "OPEN":
+                logger.info("%s CLOCK_PAUSE pair=%s entry_time=%s clock_time=%s reason=%s tracked_seconds=%.3f",
+                            cfg["label"], cfg["id"], position["entry_time"], clock_time.isoformat(), status,
+                            position["trading_seconds"])
+            cfg["_clock_log"] = {"reason": reason, "status": status, "since": clock_time}
+    else:
+        cfg.pop("_clock_log", None)
     bucket = int(utc_now().timestamp() // cfg.get("sample_interval_sec", 600))
     if cfg.get("_summary_bucket") == bucket:
         return
@@ -1013,18 +1045,18 @@ def run_pair(cfg, state, notifier, force=False):
             if position and hours >= limit:
                 position["deferred_close"] = True
                 state.set_shadow_position(ident, position)
-            pair_summary(cfg, "CLOSED_OR_NO_QUOTE")
+            pair_summary(cfg, "CLOSED_OR_NO_QUOTE", position=position)
             return
         raise
     try:
         timestamps = validate_snapshot(cfg, snap)
     except (ValueError, KeyError, TypeError) as exc:
         pending_entries.pop(ident, None)
-        pair_summary(cfg, f"REJECTED ({exc})")
+        pair_summary(cfg, f"REJECTED ({exc})", position=position)
         return
     previous_times = state.data.setdefault("latest_quote_timestamps", {}).get(ident, [])
     if any(t < p for t, p in zip(timestamps, previous_times)):
-        pair_summary(cfg, "REJECTED timestamp regression")
+        pair_summary(cfg, "REJECTED timestamp regression", position=position)
         return
     state.data["latest_quote_timestamps"][ident] = timestamps
     if not scheduled_open and quality.get("mismatch_day") != now.astimezone(ET).date().isoformat():
@@ -1064,10 +1096,10 @@ def run_pair(cfg, state, notifier, force=False):
             quality["checked_bucket"] = bucket
             quality["stale"] = stale
         if quality.get("stale"):
-            pair_summary(cfg, "STALE")
+            pair_summary(cfg, "STALE", position=position)
             return
     elif quality.get("stale"):
-        pair_summary(cfg, "STALE")
+        pair_summary(cfg, "STALE", position=position)
         return
     cfg["_last_valid_quote"] = min(timestamps)
     if position:
@@ -1090,7 +1122,7 @@ def run_pair(cfg, state, notifier, force=False):
         z, reference, beta = calc.evaluate(snap.base_price, snap.quote_price, bucket=bucket)
         previous_spread, grace = None, quality.get("grace", 0) > 0
     ages = " / ".join(f"{now.timestamp() - t:.0f}s" for t in timestamps)
-    pair_summary(cfg, "OPEN", ages)
+    pair_summary(cfg, "OPEN", ages, position=position)
     close = pair_close_signal(cfg, snap, position, z)
     if close:
         key = f"{ident}:{close.direction}:CLOSE"
@@ -1101,6 +1133,16 @@ def run_pair(cfg, state, notifier, force=False):
                 state.mark_sent(key)
                 state.mark_sent(entry_cooldown_key(cfg, position["direction"]))
                 state.clear_shadow_position(ident)
+                logger.info("%s CLOSE delivered pair=%s entry_time=%s direction=%s quote_times=%s "
+                            "tracked_seconds=%.3f wall_hours=%.6f scheduled_hours=%.6f "
+                            "reference_z=%s move_bps=%.6f reason=%s",
+                            cfg["label"], ident, position["entry_time"], position["direction"], timestamps,
+                            close.details["holding_hours"] * 3600, close.details["wall_hours"],
+                            close.details["scheduled_hours"], close.details.get("reference_z"),
+                            close.details["move_bps"], close.reason)
+            else:
+                logger.warning("%s CLOSE delivery failed pair=%s entry_time=%s; retaining tracking for retry",
+                               cfg["label"], ident, position["entry_time"])
         return
     if position or grace:
         return
@@ -1136,15 +1178,23 @@ def run_pair(cfg, state, notifier, force=False):
     if notifier.send(format_pair_message(cfg, snap, z, signal)):
         pending_entries.pop(ident, None)
         state.mark_sent(key)
+        entry_time = utc_now().isoformat()
         if cfg.get("shadow_position_enabled", True):
             state.set_shadow_position(ident, {
                 **signal.details, "direction": signal.direction, "ratio_side": ratio_side(signal.direction),
                 "entry_spread": current, "entry_ratio": snap.ratio, "entry_z": z,
-                "reference_z_close": cfg.get("z_close", .35), "entry_time": utc_now().isoformat(),
+                "reference_z_close": cfg.get("z_close", .35), "entry_time": entry_time,
                 "trading_seconds": 0.0, "clock_time": utc_now().isoformat()})
             cfg["_clock_open"] = True
             cfg["_clock_override"] = not scheduled_open
+        logger.info("%s ENTRY delivered pair=%s entry_time=%s direction=%s quote_times=%s "
+                    "method=%s beta=%.6g spread=%.8f mean=%.8f std=%.8f",
+                    cfg["label"], ident, entry_time, signal.direction, timestamps,
+                    cfg["method"], beta, current, reference[0], reference[1])
         state.save()
+    else:
+        logger.warning("%s ENTRY delivery failed pair=%s; retaining pending signal for revalidation and retry",
+                       cfg["label"], ident)
 
 
 def run_once(monitors: list[dict[str, Any]], state: AlertState, notifier: TelegramNotifier, force: bool = False) -> None:
@@ -1265,7 +1315,7 @@ def run_once(monitors: list[dict[str, Any]], state: AlertState, notifier: Telegr
         except MarketDataError as exc:
             cfg["_cycle_error"] = True
             if "legs" in cfg:
-                pair_summary(cfg, f"DATA_ERROR ({exc})")
+                pair_summary(cfg, f"DATA_ERROR ({exc})", position=state.shadow_position(cfg["id"]))
             else:
                 logger.warning("%s market data rejected: %s; will retry", cfg["label"], exc)
         except requests.RequestException as exc:

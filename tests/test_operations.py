@@ -1,3 +1,4 @@
+import logging
 import tempfile
 import unittest
 from datetime import timedelta
@@ -83,6 +84,29 @@ class OperationsTests(unittest.TestCase):
         with patch("bot.os.fsync") as sync:
             self.state.save()
         sync.assert_called_once()
+
+    def test_log_rotation_bounds_backups_and_redacts_records(self):
+        with patch("bot.ROOT", self.state.path.parent), patch("bot.logging.basicConfig") as setup:
+            bot.configure_logging("INFO")
+        stream, rotating = setup.call_args.kwargs["handlers"]
+        self.addCleanup(stream.close)
+        self.addCleanup(rotating.close)
+        self.assertEqual(rotating.maxBytes, 10 * 1024 * 1024)
+        self.assertEqual(rotating.backupCount, 5)
+        rotating.maxBytes = 256
+        with patch.dict("os.environ", {"TG_BOT_TOKEN": "test-secret-token"}):
+            for number in range(30):
+                record = logging.LogRecord("rotation-test", logging.INFO, __file__, 1,
+                                           "record=%02d token=%s", (number, "test-secret-token"), None)
+                rotating.handle(record)
+        files = list((self.state.path.parent / "logs").glob("alert-bot.log*"))
+        self.assertEqual(len(files), 6)
+        record_bytes = len((rotating.format(record) + "\n").encode("utf-8"))
+        self.assertTrue(all(path.stat().st_size <= 256 + record_bytes for path in files))
+        text = "".join(path.read_text(encoding="utf-8") for path in files)
+        self.assertNotIn("test-secret-token", text)
+        self.assertIn("record=29", text)
+        self.assertNotIn("record=00", text)
 
     def test_log_formatter_redacts_tokens_in_tracebacks_and_urls(self):
         formatter = bot.SecretFormatter("%(message)s")

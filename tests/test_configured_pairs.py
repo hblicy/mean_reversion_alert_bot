@@ -310,6 +310,130 @@ class ConfiguredPairTests(unittest.TestCase):
         self.assertIsNotNone(self.state.shadow_position("custom"))
         self.assertEqual(self.notifier.send.call_count, 1)
 
+    def test_clock_logs_each_pause_segment_without_changing_tracking_time(self):
+        self.warm()
+        self.cycle(110, now=NOW + timedelta(minutes=30))
+        with self.assertLogs(bot.logger, level="INFO") as logs:
+            for seconds in (60, 90):
+                self.clock.return_value = NOW + timedelta(minutes=30, seconds=seconds)
+                self.source.snapshot.side_effect = bot.MarketDataUnavailable(
+                    f"Variational rate limited; retry in {seconds}s")
+                bot.run_once([self.cfg], self.state, self.notifier)
+            self.source.snapshot.side_effect = None
+            self.clock.return_value = NOW + timedelta(minutes=32)
+            skewed = quote(110, now=self.clock.return_value)
+            skewed.metadata["assets"]["B"]["quote_updated_at"] = (
+                self.clock.return_value - timedelta(seconds=40)).isoformat()
+            self.source.snapshot.return_value = skewed
+            bot.run_once([self.cfg], self.state, self.notifier)
+            self.cycle(110, now=NOW + timedelta(minutes=33))
+            self.cycle(110, now=NOW + timedelta(minutes=33, seconds=30))
+        pauses = [line for line in logs.output if " CLOCK_PAUSE pair=" in line]
+        ends = [line for line in logs.output if " CLOCK_PAUSE_END pair=" in line]
+        self.assertEqual(len(pauses), 2)
+        self.assertEqual(len(ends), 2)
+        self.assertIn("rate limited", pauses[0])
+        self.assertIn("not aligned", pauses[1])
+        self.assertTrue(all("paused_seconds=60.000" in line for line in ends))
+        self.assertTrue(all("entry_time=" in line and "pair=custom" in line for line in pauses + ends))
+        self.assertEqual(self.state.shadow_position("custom")["trading_seconds"], 90)
+
+    def test_clock_logs_fault_switch_between_numbered_tickers(self):
+        cfg = copy.deepcopy(CFG)
+        cfg["legs"]["a"]["ticker"] = "US30-SWAP"
+        cfg["legs"]["b"]["ticker"] = "US100-SWAP"
+        self.cfg = self.init(cfg)
+        self.warm()
+        self.cycle(110, now=NOW + timedelta(minutes=30))
+        with self.assertLogs(bot.logger, level="INFO") as logs:
+            for seconds, ticker in ((60, "US30-SWAP"), (90, "US100-SWAP")):
+                self.clock.return_value = NOW + timedelta(minutes=30, seconds=seconds)
+                self.source.snapshot.side_effect = bot.MarketDataError(f"{ticker}: invalid BBO")
+                bot.run_once([self.cfg], self.state, self.notifier)
+            self.source.snapshot.side_effect = None
+            self.cycle(110, now=NOW + timedelta(minutes=32))
+        pauses = [line for line in logs.output if " CLOCK_PAUSE pair=" in line]
+        ends = [line for line in logs.output if " CLOCK_PAUSE_END pair=" in line]
+        self.assertEqual(len(pauses), 2)
+        self.assertEqual(len(ends), 2)
+        for pause, end, ticker in zip(pauses, ends, ("US30-SWAP", "US100-SWAP")):
+            self.assertIn(f"reason=DATA_ERROR ({ticker}: invalid BBO)", pause)
+            self.assertIn(f"reason=DATA_ERROR ({ticker}: invalid BBO)", end)
+            self.assertIn("paused_seconds=30.000", end)
+        self.assertEqual(self.state.shadow_position("custom")["trading_seconds"], 60)
+
+    def test_clock_logs_do_not_repeat_for_changing_quote_age(self):
+        self.warm()
+        self.cycle(110, now=NOW + timedelta(minutes=30))
+        stale_quote = quote(110, now=NOW + timedelta(minutes=28, seconds=30))
+        with self.assertLogs(bot.logger, level="INFO") as logs:
+            for seconds in (60, 90):
+                self.clock.return_value = NOW + timedelta(minutes=30, seconds=seconds)
+                self.source.snapshot.return_value = stale_quote
+                bot.run_once([self.cfg], self.state, self.notifier)
+            self.cycle(110, now=NOW + timedelta(minutes=32))
+        pauses = [line for line in logs.output if " CLOCK_PAUSE pair=" in line]
+        ends = [line for line in logs.output if " CLOCK_PAUSE_END pair=" in line]
+        self.assertEqual(len(pauses), 1)
+        self.assertEqual(len(ends), 1)
+        self.assertIn("age=150.0s", pauses[0])
+        self.assertIn("paused_seconds=60.000", ends[0])
+        self.assertEqual(self.state.shadow_position("custom")["trading_seconds"], 60)
+
+    def test_entry_delivery_log_records_frozen_reference_only_after_success(self):
+        self.warm()
+        self.notifier.send.return_value = False
+        with self.assertLogs(bot.logger, level="INFO") as failed:
+            self.cycle(110, now=NOW + timedelta(minutes=30))
+        self.assertFalse(any("ENTRY delivered" in line for line in failed.output))
+        self.assertTrue(any("ENTRY delivery failed" in line for line in failed.output))
+        self.notifier.send.return_value = True
+        with self.assertLogs(bot.logger, level="INFO") as delivered:
+            self.cycle(109.8, now=NOW + timedelta(minutes=30, seconds=30))
+        event = next(line for line in delivered.output if "ENTRY delivered" in line)
+        self.assertIn(self.state.shadow_position("custom")["entry_time"], event)
+        for field in ("pair=custom", "quote_times=", "beta=", "spread=", "mean=", "std="):
+            self.assertIn(field, event)
+
+    def test_close_delivery_log_keeps_failed_notification_retryable(self):
+        self.warm()
+        self.cycle(110, now=NOW + timedelta(minutes=30))
+        entry_time = self.state.shadow_position("custom")["entry_time"]
+        self.notifier.send.return_value = False
+        with self.assertLogs(bot.logger, level="INFO") as failed:
+            self.cycle(100.5, now=NOW + timedelta(minutes=31))
+        self.assertIsNotNone(self.state.shadow_position("custom"))
+        self.assertTrue(any("CLOSE delivery failed" in line for line in failed.output))
+        self.assertFalse(any("CLOSE delivered" in line for line in failed.output))
+        self.notifier.send.return_value = True
+        with self.assertLogs(bot.logger, level="INFO") as delivered:
+            self.cycle(100.4, now=NOW + timedelta(minutes=31, seconds=30))
+        event = next(line for line in delivered.output if "CLOSE delivered" in line)
+        self.assertIn(entry_time, event)
+        self.assertIn("tracked_seconds=90.000", event)
+        self.assertIn("quote_times=", event)
+        self.assertIsNone(self.state.shadow_position("custom"))
+
+    def test_close_message_distinguishes_signal_clock_and_manual_position(self):
+        start = datetime.fromisoformat("2026-10-26T23:11:00+08:00")
+        end = datetime.fromisoformat("2026-10-27T12:50:14+08:00")
+        position = {"direction": "long_a_short_b", "ratio_side": "long_ratio",
+                    "method": "beta_spread", "beta": .5,
+                    "entry_spread": bot.spread_value(52478.25, 29361.84, "beta_spread", .5),
+                    "entry_time": start.isoformat(), "trading_seconds": 9.58 * 3600,
+                    "reference_mean": 5.72772188, "reference_std": .00145831,
+                    "reference_z_close": .5}
+        snap = quote(52507.365, 29243.12, end)
+        self.clock.return_value = end
+        signal = bot.pair_close_signal(self.cfg, snap, position, .443)
+        message = bot.format_pair_message(self.cfg, snap, .443, signal)
+        for text in ("原始 ENTRY：2026-10-26 23:11:00 北京时间", "信号跟踪计时：9.58",
+                     "自然经过：13.65", "日程开市：12.65", "开市计时差：+3.07",
+                     "休市及无有效行情时暂停", "模型名义比", "按名义价值", "实际开仓时间"):
+            self.assertIn(text, message)
+        self.assertIn("-0.489", message)
+        self.assertAlmostEqual(signal.details["move_bps"], 25.804173, places=5)
+
     def test_beta_change_recomputes_history_and_discards_previous_z(self):
         self.warm()
         self.cfg["shadow_mode"] = True
