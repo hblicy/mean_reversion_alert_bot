@@ -485,7 +485,8 @@ def load_config(path: Path) -> dict[str, Any]:
     return config
 
 
-def init_monitors(config: dict[str, Any], state: AlertState) -> list[dict[str, Any]]:
+def init_monitors(config: dict[str, Any], state: AlertState,
+                  *, retry_unavailable: bool = False) -> list[dict[str, Any]]:
     validate_config(config)
     monitors = []
     sources = {}
@@ -494,7 +495,18 @@ def init_monitors(config: dict[str, Any], state: AlertState) -> list[dict[str, A
         if "legs" in item and item["source"] == VariationalV2Source.name:
             if item["source"] not in sources:
                 sources[item["source"]] = SOURCES[item["source"]]()
-            sources[item["source"]].validate_legs(item["legs"])
+            source = sources[item["source"]]
+            while True:
+                try:
+                    source.validate_legs(item["legs"])
+                    break
+                except MarketDataUnavailable as exc:
+                    if not retry_unavailable:
+                        raise
+                    delay = max(1.0, source.retry_at - time.monotonic())
+                    logger.warning("Startup market data unavailable: %s; retrying validation in %.1fs", exc, delay)
+                    time.sleep(delay)
+                    source.begin_cycle()
     for item in config.get("pairs", []):
         if not item.get("enabled", True):
             continue
@@ -1443,7 +1455,7 @@ def main() -> int:
         state_path = ROOT / state_path
     state = AlertState(state_path)
     try:
-        monitors = init_monitors(config, state)
+        monitors = init_monitors(config, state, retry_unavailable=not args.once)
     except (ValueError, requests.RequestException) as exc:
         logger.error("Startup validation failed: %s", exc)
         return 1

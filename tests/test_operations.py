@@ -122,5 +122,118 @@ class OperationsTests(unittest.TestCase):
         self.assertIn("RuntimeError", text)
 
 
+class StartupRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.state = bot.AlertState.__new__(bot.AlertState)
+        self.state.data = {"alerts": {}, "history": {}}
+        self.state.save = Mock()
+        self.notifier = Mock()
+        self.notifier.send.return_value = True
+        self.rows = [{"ticker": leg["ticker"], "contract_type": leg["contract_type"]}
+                     for leg in CFG["legs"].values()]
+        self.ready = Mock(status_code=200)
+        self.ready.json.return_value = {"listings": self.rows}
+        self.limited = Mock(status_code=429)
+        self.limited.json.return_value = {"retry_after_seconds": 75}
+        self.session = Mock()
+        self.session.get.return_value = self.ready
+        self.poll = Mock()
+        self.monotonic = 100.0
+        self.waits = []
+        patches = [patch("sys.argv", ["bot.py"]), patch("bot.load_dotenv"),
+                   patch("bot.configure_logging"), patch("bot.load_config", return_value={"pairs": [CFG]}),
+                   patch("bot.AlertState", return_value=self.state),
+                   patch("bot.TelegramNotifier", return_value=self.notifier),
+                   patch("bot.requests.Session", return_value=self.session),
+                   patch("bot.run_once", self.poll), patch("bot.utc_now", return_value=NOW),
+                   patch("bot.time.monotonic", side_effect=lambda: self.monotonic),
+                   patch("bot.time.sleep", side_effect=self.wait)]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def wait(self, seconds):
+        self.waits.append(seconds)
+        if self.poll.called:
+            raise KeyboardInterrupt
+        if len(self.waits) > 8:
+            self.fail("Startup retries did not progress to polling")
+        self.monotonic += seconds
+
+    def test_startup_rate_limit_retries_then_polls_and_sends_heartbeat(self):
+        position = {"direction": "long_a_short_b", "ratio_side": "long_ratio", "method": "beta_spread",
+                    "beta": .5, "entry_time": NOW.isoformat(), "entry_spread": 2.3,
+                    "reference_mean": 2.31, "reference_std": .01, "reference_z_close": .5,
+                    "trading_seconds": 120., "clock_time": NOW.isoformat()}
+        self.state.set_shadow_position("custom", position)
+        self.session.get.side_effect = [self.limited, self.ready]
+        with self.assertLogs(bot.logger, level="WARNING") as logs:
+            with self.assertRaises(KeyboardInterrupt):
+                bot.main()
+        self.assertEqual(self.waits, [75, 30])
+        self.assertEqual(self.session.get.call_count, 2)
+        self.poll.assert_called_once()
+        self.assertIn("每日心跳", self.notifier.send.call_args.args[0])
+        self.assertEqual(self.state.shadow_position("custom"), position)
+        self.assertTrue(any("rate limited" in line for line in logs.output))
+
+    def test_startup_network_failures_preserve_exponential_backoff(self):
+        unavailable = Mock(status_code=503)
+        unavailable.raise_for_status.side_effect = bot.requests.HTTPError("HTTP 503")
+        self.session.get.side_effect = [bot.requests.Timeout("offline"), unavailable,
+                                        bot.requests.Timeout("offline"), unavailable,
+                                        bot.requests.Timeout("offline"), self.ready]
+        with self.assertLogs(bot.logger, level="WARNING"):
+            with self.assertRaises(KeyboardInterrupt):
+                bot.main()
+        self.assertEqual(self.waits, [30, 60, 120, 240, 300, 30])
+        self.assertEqual(self.session.get.call_count, 6)
+        self.poll.assert_called_once()
+        source = self.poll.call_args.args[0][0]["_source"]
+        self.assertEqual(source.failures, 0)
+
+    def test_startup_zero_retry_delay_waits_before_retrying(self):
+        self.limited.json.return_value = {"retry_after_seconds": 0}
+        self.session.get.side_effect = [self.limited, self.ready]
+        with self.assertLogs(bot.logger, level="WARNING"):
+            with self.assertRaises(KeyboardInterrupt):
+                bot.main()
+        self.assertEqual(self.waits, [1, 30])
+        self.assertEqual(self.session.get.call_count, 2)
+
+    def test_startup_unknown_ticker_still_fails_without_retry(self):
+        self.rows.pop()
+        with self.assertLogs(bot.logger, level="ERROR") as logs:
+            self.assertEqual(bot.main(), 1)
+        self.assertTrue(any("not found" in line for line in logs.output))
+        self.assertEqual(self.waits, [])
+        self.assertEqual(self.session.get.call_count, 1)
+        self.poll.assert_not_called()
+
+    def test_startup_wrong_contract_still_fails_without_retry(self):
+        self.rows[0]["contract_type"] = "perpetual"
+        with self.assertLogs(bot.logger, level="ERROR") as logs:
+            self.assertEqual(bot.main(), 1)
+        self.assertTrue(any("contract_type" in line for line in logs.output))
+        self.assertEqual(self.waits, [])
+        self.assertEqual(self.session.get.call_count, 1)
+        self.poll.assert_not_called()
+
+    def test_startup_once_keeps_single_attempt_on_rate_limit(self):
+        self.session.get.return_value = self.limited
+        with patch("sys.argv", ["bot.py", "--once"]), self.assertLogs(bot.logger, level="ERROR"):
+            self.assertEqual(bot.main(), 1)
+        self.assertEqual(self.waits, [])
+        self.assertEqual(self.session.get.call_count, 1)
+        self.poll.assert_not_called()
+
+    def test_startup_unexpected_error_reaches_caller(self):
+        self.session.get.side_effect = RuntimeError("unexpected adapter failure")
+        with self.assertRaisesRegex(RuntimeError, "unexpected adapter failure"):
+            bot.main()
+        self.assertEqual(self.waits, [])
+        self.poll.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
