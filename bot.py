@@ -941,59 +941,30 @@ def format_pair_message(cfg, snap, z, signal):
     closing = signal.level == "CLOSE"
     tier = " ·观察级·弱相关" if cfg.get("tier") == "observe" else ""
     beta = details.get("beta", 1.0)
-    method = details.get("method", cfg["method"])
     a, b = (cfg["legs"][key]["name"] for key in ("a", "b"))
     always = all(leg["session"] == "always" for leg in cfg["legs"].values())
     pause_note = "" if always else "（休市及无有效行情时暂停）"
     lines = [f"{'🔵' if closing else '🟢'} [{signal.level}] {cfg['label']} {'结束跟踪' if closing else '偏离'}提醒{tier}",
-             f"方向参考：{signal.action}（模型名义比 {a}:{b} = 1 : {beta:.2f}，按名义价值；仅参考）",
-             f"方法：{method} β={beta:.2f}｜窗口 {cfg['window_buckets']} 桶（每桶 {cfg.get('sample_interval_sec', 600)} 秒）"]
+             f"方向参考：{signal.action}（名义比 {a}:{b} = 1 : {beta:.2f}）"]
+    z_values = []
     if z is not None:
-        lines.append(f"滚动 Z：{z:+.3f}（阈值 {cfg['z_open']:.2f}）")
+        z_values.append(f"滚动 Z：{z:+.3f}" + ("" if closing else f"（阈值 {cfg['z_open']:.2f}）"))
+    if closing and "reference_z" in details:
+        z_values.append(f"ENTRY 基准 Z：{details['reference_z']:+.3f}")
+    if z_values:
+        lines.append("｜".join(z_values))
     if closing:
         lines.append(f"原因：{signal.reason}")
-        if "reference_z" in details:
-            lines.append(f"相对 ENTRY 固定基准 Z：{details['reference_z']:+.3f}")
-        lines.extend([f"信号方向上的价差变化：{details['move_bps']:+.2f} bps（不是持仓收益率）",
-                      f"原始 ENTRY：{parse_timestamp(details['entry_time']).astimezone(BEIJING):%Y-%m-%d %H:%M:%S} 北京时间",
-                      f"信号跟踪计时：{details['holding_hours']:.2f} 个{'自然' if always else '交易'}小时{pause_note}",
-                      f"自然经过：{details['wall_hours']:.2f} 小时｜日程开市：{details['scheduled_hours']:.2f} 小时｜"
-                      f"开市计时差：{details['scheduled_hours'] - details['holding_hours']:+.2f} 小时"])
+        lines.extend([f"原始 ENTRY：{parse_timestamp(details['entry_time']).astimezone(BEIJING):%Y-%m-%d %H:%M:%S} 北京时间",
+                      f"信号跟踪计时：{details['holding_hours']:.2f} 个{'自然' if always else '交易'}小时{pause_note}"])
         if details.get("deferred"):
             lines.append("（休市期间到期，开市后补发）")
     else:
-        mu, sigma = details["reference_mean"], details["reference_std"]
-        width = sigma * cfg.get("z_close", .35)
-        lines.extend([f"价差 s：{details['spread']:.8f}｜冻结均值 {mu:.8f}",
-                      f"回归区间 {mu - width:.8f} ～ {mu + width:.8f}（±{cfg.get('z_close', .35):g}σ）"])
-    assets = snap.metadata["assets"]
-    lines.append(f"中间价：{snap.base} {snap.base_price:,.4f}｜{snap.quote} {snap.quote_price:,.4f}（Variational {cfg.get('quote_size', 'size_1k')}）")
-    lines.extend(format_variational_metadata(snap))
-    for name, asset in assets.items():
-        spread = asset.get("base_spread_bps")
-        spread_text = f"{spread:.2f} bps" if spread is not None else "N/A"
-        funding = asset.get("funding")
-        funding_text = "N/A"
-        if funding:
-            if "annualized_rate" in funding:
-                rate = funding["annualized_rate"]
-                funding_text = f"年化 {rate:.2%}（正数多付空收，负数反向）"
-            else:
-                long_rate, short_rate = funding["annualized_long_rate"], funding["annualized_short_rate"]
-                funding_text = f"年化 多{'付' if long_rate >= 0 else '收'} {abs(long_rate):.2%} / 空{'收' if short_rate >= 0 else '付'} {abs(short_rate):.2%}"
-                payment = funding.get("next_timestamp")
-                if isinstance(payment, (int, float)) and datetime.fromtimestamp(payment, timezone.utc).astimezone(ET).weekday() == 4:
-                    funding_text += "（周五含周末，按接口费率）"
-        lines.append(f"{name} 点差：{spread_text}；资金费 {funding_text}（仅展示）")
-    close = cfg["_calendar"].next_close(cfg["legs"], utc_now())
-    if close:
-        lines.append(f"时段：两腿开市；距休市 {(close - utc_now()).total_seconds() / 3600:.1f} 小时（{close.astimezone(BEIJING):%m-%d %H:%M} 北京时间）")
-    else:
-        lines.append("时段：两腿有有效报价；以接口为准")
-    limit = cfg.get("max_holding_hours", 72) if all(leg["session"] == "always" for leg in cfg["legs"].values()) else cfg.get("max_holding_trading_hours", 46)
-    lines.extend([f"时间：{utc_now().astimezone(BEIJING):%Y-%m-%d %H:%M:%S} 北京时间；最多跟踪 {limit:g} 个{'自然' if all(leg['session'] == 'always' for leg in cfg['legs'].values()) else '交易'}小时。",
-                  f"跟踪基于原始 ENTRY 信号{pause_note}，不代表你的实际开仓时间或持仓盈亏。",
-                  "仅行情提醒，机器人不会下单；请在 Variational 自行核对报价与成本。"])
+        limit = cfg.get("max_holding_hours", 72) if always else cfg.get("max_holding_trading_hours", 46)
+        lines.append(f"最多跟踪 {limit:g} 个{'自然' if always else '交易'}小时{pause_note}")
+    lines.extend([f"中间价：{snap.base} {snap.base_price:,.4f}｜{snap.quote} {snap.quote_price:,.4f}",
+                  f"时间：{utc_now().astimezone(BEIJING):%Y-%m-%d %H:%M:%S} 北京时间",
+                  "仅信号跟踪，不代表实际开仓时间或持仓盈亏；不自动下单，请在 Variational 核对报价与成本。"])
     return "\n".join(lines)
 
 

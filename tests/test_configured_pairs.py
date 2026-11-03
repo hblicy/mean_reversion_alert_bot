@@ -63,8 +63,13 @@ class ConfiguredPairTests(unittest.TestCase):
         self.warm()
         self.cycle(110, now=NOW + timedelta(minutes=30))
         self.assertEqual(self.state.shadow_position("custom")["direction"], "short_a_long_b")
-        self.assertIn("空 A / 多 B", self.notifier.send.call_args.args[0])
-        self.assertIn("北京时间", self.notifier.send.call_args.args[0])
+        message = self.notifier.send.call_args.args[0]
+        for text in ("空 A / 多 B", "名义比 A:B = 1 : 0.50", "滚动 Z：", "中间价：",
+                     "最多跟踪 46 个交易小时", "休市及无有效行情时暂停", "北京时间", "不自动下单"):
+            self.assertIn(text, message)
+        for text in ("方法：", "窗口", "冻结均值", "回归区间", "行情报价档位", "资金费", "点差", "时段："):
+            self.assertNotIn(text, message)
+        self.assertLessEqual(len(message.splitlines()), 7)
 
     def test_allowed_side_and_shadow_mode(self):
         self.cfg["allowed_sides"] = ["long_a_short_b"]
@@ -428,10 +433,14 @@ class ConfiguredPairTests(unittest.TestCase):
         signal = bot.pair_close_signal(self.cfg, snap, position, .443)
         message = bot.format_pair_message(self.cfg, snap, .443, signal)
         for text in ("原始 ENTRY：2026-10-26 23:11:00 北京时间", "信号跟踪计时：9.58",
-                     "自然经过：13.65", "日程开市：12.65", "开市计时差：+3.07",
-                     "休市及无有效行情时暂停", "模型名义比", "按名义价值", "实际开仓时间"):
+                     "休市及无有效行情时暂停", "名义比 A:B = 1 : 0.50", "实际开仓时间",
+                     "持仓盈亏", "不自动下单", "原因：", "滚动 Z：+0.443", "ENTRY 基准 Z：-0.489"):
             self.assertIn(text, message)
-        self.assertIn("-0.489", message)
+        for text in ("自然经过：", "日程开市：", "开市计时差：", "方法：", "行情报价档位", "资金费", "点差", "时段："):
+            self.assertNotIn(text, message)
+        self.assertLessEqual(len(message.splitlines()), 9)
+        self.assertAlmostEqual(signal.details["wall_hours"], 13.6538889)
+        self.assertAlmostEqual(signal.details["scheduled_hours"], 12.6538889)
         self.assertAlmostEqual(signal.details["move_bps"], 25.804173, places=5)
 
     def test_beta_change_recomputes_history_and_discards_previous_z(self):
