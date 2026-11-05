@@ -343,11 +343,13 @@ class VariationalV2Source(HttpSource):
         self.session = session if session is not None else requests.Session()
         self.retry_at = 0.0
         self.failures = 0
+        self.last_error = None
         self.begin_cycle()
 
     def begin_cycle(self):
         self._listings = None
         self._cycle_error = None
+        self._request_attempted = False
 
     def _stats(self):
         if self._cycle_error:
@@ -357,6 +359,7 @@ class VariationalV2Source(HttpSource):
         now = time.monotonic()
         if now < self.retry_at:
             raise MarketDataUnavailable(f"Variational backoff: retry in {self.retry_at - now:.0f}s")
+        self._request_attempted = True
         try:
             response = self.session.get(self.url, timeout=self.timeout,
                                         headers={"User-Agent": "mean-reversion-alert-bot/2.0"})
@@ -367,8 +370,13 @@ class VariationalV2Source(HttpSource):
                         raise ValueError("Invalid retry delay")
                 except (ValueError, KeyError, TypeError):
                     delay = 30.0
+                self.failures += 1
+                delay = max(delay, min(30 * 2 ** min(self.failures - 1, 4), 300))
                 self.retry_at = now + delay
                 self._cycle_error = f"Variational rate limited; retry in {delay:g}s"
+                self.last_error = self._cycle_error
+                logger.warning("Variational request failed: HTTP 429; consecutive_failures=%s retry_in=%gs",
+                               self.failures, delay)
                 raise MarketDataError(self._cycle_error)
             response.raise_for_status()
             if response.status_code >= 500:
@@ -383,8 +391,14 @@ class VariationalV2Source(HttpSource):
                 delay = min(30 * 2 ** min(self.failures - 1, 4), 300)
                 self.retry_at = now + delay
                 self._cycle_error = f"Variational fetch failed ({type(exc).__name__}); retry in {delay}s"
+                self.last_error = self._cycle_error
+                logger.warning("Variational request failed (%s); consecutive_failures=%s retry_in=%ss",
+                               type(exc).__name__, self.failures, delay)
             raise MarketDataUnavailable(self._cycle_error) from None
+        if self.failures:
+            logger.info("Variational requests recovered after %s failed attempt(s)", self.failures)
         self.failures = 0
+        self.last_error = None
         self._listings = {row["ticker"]: row for row in rows}
         return self._listings
 
@@ -1245,6 +1259,9 @@ def run_once(monitors: list[dict[str, Any]], state: AlertState, notifier: Telegr
             source.begin_cycle()
     for cfg in monitors:
         cfg["_cycle_error"] = False
+        cfg["_cycle_market_error"] = False
+        cfg["_cycle_waiting"] = False
+        cfg["_cycle_error_reason"] = None
         try:
             if "legs" in cfg:
                 run_pair(cfg, state, notifier, force)
@@ -1355,15 +1372,22 @@ def run_once(monitors: list[dict[str, Any]], state: AlertState, notifier: Telegr
                 logger.info("%s signal suppressed by cooldown: %s %s", cfg["label"], signal.direction, signal.level)
         except MarketDataError as exc:
             cfg["_cycle_error"] = True
+            cfg["_cycle_market_error"] = True
+            source = cfg["_source"]
+            cfg["_cycle_waiting"] = (isinstance(exc, MarketDataUnavailable)
+                                     and isinstance(source, VariationalV2Source) and not source._request_attempted)
+            cfg["_cycle_error_reason"] = (source.last_error if cfg["_cycle_waiting"] else None) or str(exc)
             if "legs" in cfg:
                 pair_summary(cfg, f"DATA_ERROR ({exc})", position=state.shadow_position(cfg["id"]))
             else:
                 logger.warning("%s market data rejected: %s; will retry", cfg["label"], exc)
         except requests.RequestException as exc:
             cfg["_cycle_error"] = True
+            cfg["_cycle_error_reason"] = f"网络请求失败（{type(exc).__name__}）"
             logger.warning("%s network request failed (%s); will retry", cfg["label"], type(exc).__name__)
         except Exception as exc:
             cfg["_cycle_error"] = True
+            cfg["_cycle_error_reason"] = f"运行异常（{type(exc).__name__}），请检查日志"
             logger.exception("Monitor failed for %s: %s", cfg.get("label", cfg.get("id")), exc)
             failures.append(exc)
     state.save()
@@ -1379,6 +1403,7 @@ class BotHealth:
         self.previous_time = None
         self.last_quote = None
         self.open_without_quote = 0.0
+        self.degraded = False
 
     def _send(self, notifier, message):
         try:
@@ -1392,7 +1417,13 @@ class BotHealth:
         if not live:
             return
         now = utc_now()
-        self.failures = self.failures + 1 if cycle_failed or any(cfg.get("_cycle_error") for cfg in live) else 0
+        opened = [cfg for cfg in live if "legs" not in cfg or cfg["_calendar"].pair_is_open(cfg["legs"], now)]
+        errors = [cfg for cfg in live if cfg.get("_cycle_error")
+                  and (not cfg.get("_cycle_market_error") or cfg in opened)]
+        if cycle_failed or any(not cfg.get("_cycle_waiting") for cfg in errors):
+            self.failures += 1
+        elif not errors:
+            self.failures = 0
         quotes = [cfg["_last_valid_quote"] for cfg in live if cfg.get("_last_valid_quote") is not None]
         latest = max(quotes) if quotes else None
         if latest is not None and (self.last_quote is None or latest > self.last_quote):
@@ -1403,12 +1434,34 @@ class BotHealth:
                          if "legs" in cfg else (now - self.previous_time).total_seconds() for cfg in live]
             self.open_without_quote += max(durations, default=0)
         self.previous_time = now
-        due = self.failures >= 5 or self.open_without_quote >= 1800
+        due = self.failures >= 5 or (bool(opened) and self.open_without_quote >= 1800)
         if due and now.timestamp() - self.data.get("degraded_sent", 0) >= 6 * 3600:
-            message = (f"⚠️ bot degraded：连续失败 {self.failures} 轮；开市无有效报价 {self.open_without_quote / 60:.1f} 分钟。\n"
-                       f"{now.astimezone(BEIJING):%Y-%m-%d %H:%M:%S} 北京时间；请检查日志。")
+            reasons = []
+            for cfg in errors or (opened if not cycle_failed else []):
+                reason = cfg.get("_cycle_error_reason") or cfg.get("_status", "未取得有效报价")
+                if "rate limited" in reason:
+                    reason = "行情接口限流（HTTP 429）"
+                if cfg.get("_cycle_waiting"):
+                    reason += "，退避等待中"
+                reasons.append(f"{cfg['label']}：{reason}")
+            if cycle_failed:
+                reasons.append("轮询或历史存储异常，请检查日志")
+            message = (f"⚠️ bot degraded：连续失败 {self.failures} 次（退避等待不累计）\n"
+                       f"原因：{'；'.join(reasons)}\n"
+                       f"开市未更新有效报价 {self.open_without_quote / 60:.1f} 分钟｜"
+                       f"{now.astimezone(BEIJING):%Y-%m-%d %H:%M:%S} 北京时间")
             if self._send(notifier, message):
                 self.data["degraded_sent"] = now.timestamp()
+                self.degraded = True
+        if self.degraded and not cycle_failed and not errors and opened and all(
+                not cfg.get("_cycle_error") and cfg.get("_status") == "OPEN"
+                and cfg.get("_last_valid_quote") is not None
+                and 0 <= now.timestamp() - cfg["_last_valid_quote"] <= cfg.get("max_quote_age_sec", 120)
+                for cfg in opened):
+            message = (f"✅ 行情恢复｜{'、'.join(cfg['label'] for cfg in opened)}\n"
+                       f"已重新取得有效报价｜{now.astimezone(BEIJING):%Y-%m-%d %H:%M:%S} 北京时间")
+            if self._send(notifier, message):
+                self.degraded = False
         local = now.astimezone(BEIJING)
         day = local.date().isoformat()
         if local.hour >= 9 and self.data.get("heartbeat_day") != day:
@@ -1501,6 +1554,7 @@ def main() -> int:
     health = BotHealth(state)
     while True:
         failed = False
+        cycle_failed = False
         try:
             try:
                 run_once(monitors, state, notifier, force=args.force_alert)
@@ -1509,10 +1563,11 @@ def main() -> int:
                 history.flush()
         except Exception:
             failed = True
+            cycle_failed = True
             logger.exception("Polling cycle failed; keeping bot alive for the next cycle")
         try:
             if not args.once:
-                health.tick(monitors, notifier, cycle_failed=failed)
+                health.tick(monitors, notifier, cycle_failed=cycle_failed)
         except Exception:
             logger.exception("Bot health update failed; will retry next cycle")
         if args.once:

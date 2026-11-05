@@ -21,7 +21,7 @@ https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/v2/stats
 
 `US500-SWAP`、`CNA50-SWAP` 是可用的指数 ticker，本次未配置该组合。**US500-PERP 是 SPY ETF 永续，不是 US500 指数 swap。** 启动时校验所有配置腿的 ticker 存在且 contract_type 一致，错配拒绝启动。
 
-所有组合共享一个 HTTP Session，每轮只拉取一次 v2 全量行情，超时 12 秒。429 按接口 `retry_after_seconds` 等待；网络/服务异常采用 30、60、120、240、300 秒退避。v1 `variational_metadata` 保留为永续行情的显式回退，指数 swap 必须使用 v2。Binance/OKX/Yahoo 旧适配器已移除。
+所有组合共享一个 HTTP Session，每轮只拉取一次 v2 全量行情，超时 12 秒。429 和网络/服务异常均采用 30、60、120、240、300 秒递增退避；429 的实际等待时间取该阶梯与接口 `retry_after_seconds` 的较大值，成功取得行情后重置。每次请求失败记录原因、连续失败次数和重试间隔，接口恢复时记录日志。v1 `variational_metadata` 保留为永续行情的显式回退，指数 swap 必须使用 v2。Binance/OKX/Yahoo 旧适配器已移除。
 
 官方接口说明：[Read-Only API](https://docs.variational.io/technical-documentation/api)。
 
@@ -87,7 +87,7 @@ PY
 
 ## 运行监控
 
-连续 5 轮失败或共同开市期间 30 分钟无有效报价会推送 `bot degraded`，6 小时冷却。每天 09:00 北京时间后首轮发送一次心跳，包含每组窗口进度、最新报价年龄、开闭市状态、跟踪状态；重启后可补发当日未送达的心跳。
+连续 5 次实际失败或共同开市期间 30 分钟未更新有效报价会推送 `bot degraded`，6 小时冷却，消息包含失败原因和组合名称。退避等待不增加也不清零连续失败次数；计划休市期间的行情获取失败不计入该告警，程序或历史存储异常仍会计入。告警送达后，本进程在开市期间重新取得通过校验的有效报价且本轮无相关处理异常时，发送一次恢复通知；恢复通知失败会重试。恢复不会重置 6 小时告警冷却。每天 09:00 北京时间后首轮发送一次心跳，包含每组窗口进度、最新报价年龄、开闭市状态、跟踪状态；重启后可补发当日未送达的心跳。
 
 日志由 bot.py 写入 `logs/alert-bot.log`，轮转阈值为 10 MiB，保留 5 份备份（`.1` 最新、`.5` 最旧），正常总量约 60 MiB；单条超大日志可能超过轮转阈值。已有超大历史备份不会在启动时截断；先保留作排查证据，归档后再人工清理，不应据此直接认定当前轮转失效。`start.sh` 不再同时重定向到同一个文件，避免重复写入及轮转失效；其他启动方式也不要使用 `>> logs/alert-bot.log 2>&1`。systemd 示例见 [deploy/alert-bot.service](deploy/alert-bot.service)，部署前修改 User、WorkingDirectory、EnvironmentFile 和 ExecStart；该文件仅供部署参考，不会自动安装或启用。
 

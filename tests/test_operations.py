@@ -198,7 +198,7 @@ class StartupRecoveryTests(unittest.TestCase):
         with self.assertLogs(bot.logger, level="WARNING"):
             with self.assertRaises(KeyboardInterrupt):
                 bot.main()
-        self.assertEqual(self.waits, [1, 30])
+        self.assertEqual(self.waits, [30, 30])
         self.assertEqual(self.session.get.call_count, 2)
 
     def test_startup_api_failure_does_not_block_due_wall_timeout(self):
