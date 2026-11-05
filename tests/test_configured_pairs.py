@@ -518,7 +518,7 @@ class ConfiguredPairTests(unittest.TestCase):
         self.source.snapshot.assert_not_called()
 
     def test_same_bucket_update_closes_on_risk_using_prior_window(self):
-        self.cfg = self.init(dict(CFG, method="ratio", entry_max_z=4))
+        self.cfg = self.init(dict(CFG, method="ratio", entry_max_z=4, risk_max_reference_z=4))
         self.cfg["_calc"] = bot.SpreadCalculator(3, method="ratio", history=[.99, 1., 1.01])
         self.state.set_shadow_position("custom", {
             "direction": "short_a_long_b", "ratio_side": "short_ratio", "method": "ratio", "beta": 1.,
@@ -533,7 +533,7 @@ class ConfiguredPairTests(unittest.TestCase):
         self.assertIn("+5.000", self.notifier.send.call_args.args[0])
 
     def test_same_bucket_risk_reference_survives_restart(self):
-        cfg = dict(CFG, method="ratio", entry_max_z=4)
+        cfg = dict(CFG, method="ratio", entry_max_z=4, risk_max_reference_z=4)
         self.cfg = self.init(cfg)
         self.cfg["_calc"] = bot.SpreadCalculator(3, method="ratio", history=[.99, 1., 1.01])
         self.state.set_shadow_position("custom", {
@@ -546,6 +546,143 @@ class ConfiguredPairTests(unittest.TestCase):
         self.cycle(105, now=NOW + timedelta(seconds=30))
         self.assertIsNone(self.state.shadow_position("custom"))
         self.assertEqual(self.notifier.send.call_count, 1)
+
+    def test_frozen_risk_triggers_with_low_or_unavailable_rolling_z(self):
+        self.cfg.update(method="ratio", entry_max_z=0, risk_max_reference_z=4)
+        for direction, entry, current in (("short_a_long_b", 1.02, 1.06),
+                                           ("long_a_short_b", .98, .94)):
+            for rolling_z in (None, 1.2, -1.2):
+                with self.subTest(direction=direction, rolling_z=rolling_z):
+                    position = {"direction": direction, "method": "ratio", "beta": 1.,
+                                "entry_spread": entry, "entry_time": NOW.isoformat(),
+                                "reference_mean": 1., "reference_std": .01, "reference_z_close": .5}
+                    signal = bot.pair_close_signal(self.cfg, quote(current * 100), position, rolling_z)
+                    self.assertIsNotNone(signal)
+                    self.assertIn("风险提醒", signal.reason)
+                    self.assertAlmostEqual(abs(signal.details["reference_z"]), 6)
+
+    def test_frozen_risk_replays_adverse_beta_spread_with_low_rolling_z(self):
+        self.cfg.update(entry_max_z=0, risk_max_reference_z=4)
+        position = {"direction": "short_a_long_b", "method": "beta_spread", "beta": .5,
+                    "entry_spread": 5.739599484808029, "entry_time": NOW.isoformat(),
+                    "reference_mean": 5.731897576902534, "reference_std": .0024535063516973174,
+                    "reference_z_close": .5}
+        signal = bot.pair_close_signal(self.cfg, quote(53536.74, 28251.58), position, 1.5916860862799334)
+        self.assertIsNotNone(signal)
+        self.assertIn("风险提醒", signal.reason)
+        self.assertAlmostEqual(signal.details["reference_z"], 12.950248583635528)
+
+    def test_frozen_risk_boundary_requires_adverse_move(self):
+        self.cfg.update(method="ratio", entry_max_z=0, risk_max_reference_z=4)
+        for direction, entry, current, should_close in (
+                ("short_a_long_b", 1.02, 1.04, True),
+                ("long_a_short_b", .98, .96, True),
+                ("short_a_long_b", 1.08, 1.06, False),
+                ("long_a_short_b", .92, .94, False)):
+            with self.subTest(direction=direction, entry=entry):
+                position = {"direction": direction, "method": "ratio", "beta": 1.,
+                            "entry_spread": entry, "entry_time": NOW.isoformat(),
+                            "reference_mean": 1., "reference_std": .01, "reference_z_close": .5}
+                signal = bot.pair_close_signal(self.cfg, quote(current * 100), position, None)
+                self.assertEqual(signal is not None, should_close)
+
+    def test_entry_limit_does_not_control_frozen_risk(self):
+        self.cfg.update(method="ratio", entry_max_z=4, risk_max_reference_z=0)
+        position = {"direction": "short_a_long_b", "method": "ratio", "beta": 1.,
+                    "entry_spread": 1.02, "entry_time": NOW.isoformat(),
+                    "reference_mean": 1., "reference_std": .01, "reference_z_close": .5}
+        self.assertIsNone(bot.pair_close_signal(self.cfg, quote(106), position, 8))
+
+    def test_failed_frozen_risk_retries_after_restart_during_warmup(self):
+        cfg = dict(CFG, method="ratio", entry_max_z=0, risk_max_reference_z=4)
+        self.cfg = self.init(cfg)
+        position = {"direction": "short_a_long_b", "method": "ratio", "beta": 1.,
+                    "entry_spread": 1.02, "entry_time": NOW.isoformat(),
+                    "reference_mean": 1., "reference_std": .01, "reference_z_close": .5}
+        self.state.set_shadow_position("custom", position)
+        self.notifier.send.return_value = False
+        with self.assertLogs(bot.logger, level="WARNING") as logs:
+            self.cycle(106)
+        self.assertTrue(any("CLOSE delivery failed" in line for line in logs.output))
+        self.assertEqual(self.state.shadow_position("custom")["entry_time"], position["entry_time"])
+        self.assertFalse(self.state.data["alerts"])
+        self.state = bot.AlertState(self.state.path)
+        self.cfg = self.init(cfg)
+        self.notifier.send.return_value = True
+        self.cycle(107, now=NOW + timedelta(seconds=30))
+        self.assertIsNone(self.state.shadow_position("custom"))
+        self.assertEqual(self.notifier.send.call_count, 2)
+        self.assertIn("风险提醒", self.notifier.send.call_args.args[0])
+        self.cycle(107, now=NOW + timedelta(seconds=60))
+        self.assertEqual(self.notifier.send.call_count, 2)
+
+    def test_wall_timeout_at_boundary_does_not_fetch_quotes(self):
+        self.cfg["max_holding_hours"] = 48
+        due = NOW + timedelta(hours=48)
+        self.state.set_shadow_position("custom", {
+            "direction": "short_a_long_b", "ratio_side": "short_ratio", "method": "beta_spread", "beta": .5,
+            "entry_time": NOW.isoformat(), "clock_time": (due - timedelta(seconds=1)).isoformat(),
+            "trading_seconds": 2 * 3600})
+        self.cfg["_clock_open"] = False
+        self.source.snapshot.side_effect = bot.MarketDataError("CLOSED_OR_NO_QUOTE")
+        self.clock.return_value = due - timedelta(seconds=1)
+        bot.run_once([self.cfg], self.state, self.notifier)
+        self.notifier.send.assert_not_called()
+        self.source.snapshot.reset_mock()
+        self.clock.return_value = due
+        bot.run_once([self.cfg], self.state, self.notifier)
+        self.source.snapshot.assert_not_called()
+        self.notifier.send.assert_called_once()
+        self.assertIsNone(self.state.shadow_position("custom"))
+        message = self.notifier.send.call_args.args[0]
+        self.assertIn("48", message)
+        self.assertIn("自然", message)
+        self.assertIn("原始 ENTRY", message)
+        self.assertNotIn("中间价", message)
+        self.assertLessEqual(len(message.splitlines()), 7)
+        bot.run_once([self.cfg], self.state, self.notifier)
+        self.assertEqual(self.notifier.send.call_count, 1)
+
+    def test_failed_wall_timeout_retries_offline_after_restart(self):
+        cfg = dict(CFG, max_holding_hours=48, cooldown_sec=1800)
+        self.cfg = self.init(cfg)
+        due = NOW + timedelta(hours=48)
+        self.state.set_shadow_position("custom", {
+            "direction": "short_a_long_b", "ratio_side": "short_ratio", "method": "beta_spread", "beta": .5,
+            "entry_time": NOW.isoformat(), "clock_time": due.isoformat(), "trading_seconds": 0})
+        self.clock.return_value = due
+        self.source.snapshot.side_effect = bot.MarketDataUnavailable("offline")
+        self.notifier.send.return_value = False
+        with self.assertLogs(bot.logger, level="WARNING"):
+            bot.run_once([self.cfg], self.state, self.notifier)
+        self.source.snapshot.assert_not_called()
+        self.assertIsNotNone(self.state.shadow_position("custom"))
+        self.assertFalse(self.state.data["alerts"])
+        self.state = bot.AlertState(self.state.path)
+        self.cfg = self.init(cfg)
+        self.notifier.send.return_value = True
+        self.clock.return_value = due + timedelta(seconds=30)
+        with self.assertLogs(bot.logger, level="INFO") as logs:
+            bot.run_once([self.cfg], self.state, self.notifier)
+        self.assertTrue(any("CLOSE delivered" in line and "wall_hours=" in line for line in logs.output))
+        self.source.snapshot.assert_not_called()
+        self.assertIsNone(self.state.shadow_position("custom"))
+        self.assertEqual(self.notifier.send.call_count, 2)
+        self.assertIn(bot.entry_cooldown_key(cfg, "short_a_long_b"), self.state.data["alerts"])
+
+    def test_shadow_wall_timeout_keeps_tracking_without_sending(self):
+        self.cfg.update(max_holding_hours=48, shadow_mode=True)
+        due = NOW + timedelta(hours=48)
+        self.state.set_shadow_position("custom", {
+            "direction": "short_a_long_b", "ratio_side": "short_ratio", "method": "beta_spread", "beta": .5,
+            "entry_time": NOW.isoformat(), "clock_time": due.isoformat(), "trading_seconds": 0})
+        self.clock.return_value = due
+        with self.assertLogs(bot.logger, level="INFO") as logs:
+            bot.run_once([self.cfg], self.state, self.notifier)
+        self.assertTrue(any("SHADOW" in line and "timeout" in line for line in logs.output))
+        self.notifier.send.assert_not_called()
+        self.source.snapshot.assert_not_called()
+        self.assertIsNotNone(self.state.shadow_position("custom"))
 
     def test_restart_discards_persisted_session_override(self):
         sunday = datetime(2026, 10, 25, 22, tzinfo=timezone.utc)
@@ -735,7 +872,9 @@ class ConfigValidationTests(unittest.TestCase):
 
     def test_invalid_params_rejected(self):
         for key, value in (("window_buckets", 1), ("z_open", float("nan")), ("shadow_mode", "false"),
-                           ("allowed_sides", ["LONG_RATIO"])):
+                           ("allowed_sides", ["LONG_RATIO"]), ("risk_max_reference_z", -1),
+                           ("risk_max_reference_z", float("nan")), ("risk_max_reference_z", True),
+                           ("risk_max_reference_z", "4"), ("max_holding_hours", 0)):
             cfg = dict(CFG, **{key: value})
             with self.assertRaises(ValueError, msg=key):
                 bot.validate_config({"pairs": [cfg]})

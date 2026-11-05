@@ -57,6 +57,7 @@ def validate_config(config):
             if type(value) is not int or value < minimum:
                 raise ValueError(f"{prefix}: invalid {key}")
         for key, default in (("z_open", None), ("z_close", .35), ("entry_max_z", 0), ("z_vol_max", 0),
+                              ("risk_max_reference_z", 0),
                               ("cooldown_sec", 1800), ("close_cooldown_sec", 300),
                               ("max_quote_age_sec", 120), ("max_quote_skew_sec", 30),
                               ("max_holding_hours", 72), ("max_holding_trading_hours", 46)):

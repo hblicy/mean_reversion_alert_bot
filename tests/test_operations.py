@@ -201,6 +201,44 @@ class StartupRecoveryTests(unittest.TestCase):
         self.assertEqual(self.waits, [1, 30])
         self.assertEqual(self.session.get.call_count, 2)
 
+    def test_startup_api_failure_does_not_block_due_wall_timeout(self):
+        cfg = dict(CFG, max_holding_hours=48)
+        self.state.set_shadow_position("custom", {
+            "direction": "short_a_long_b", "ratio_side": "short_ratio", "method": "beta_spread", "beta": .5,
+            "entry_time": (NOW - timedelta(hours=49)).isoformat(),
+            "clock_time": NOW.isoformat(), "trading_seconds": 0})
+        self.session.get.return_value = self.limited
+        with patch("bot.load_config", return_value={"pairs": [cfg]}), \
+             patch("bot.time.sleep", side_effect=KeyboardInterrupt), \
+             self.assertLogs(bot.logger, level="WARNING"):
+            with self.assertRaises(KeyboardInterrupt):
+                bot.main()
+        self.notifier.send.assert_called_once()
+        self.assertIn("自然经过 49.00 小时", self.notifier.send.call_args.args[0])
+        self.assertIsNone(self.state.shadow_position("custom"))
+        self.session.get.assert_called_once()
+        self.poll.assert_not_called()
+
+    def test_startup_wait_checks_deadline_without_fetching_before_backoff(self):
+        cfg = dict(CFG, max_holding_hours=48)
+        self.state.set_shadow_position("custom", {
+            "direction": "short_a_long_b", "ratio_side": "short_ratio", "method": "beta_spread", "beta": .5,
+            "entry_time": (NOW - timedelta(hours=48) + timedelta(seconds=10)).isoformat(),
+            "clock_time": NOW.isoformat(), "trading_seconds": 0})
+        self.session.get.side_effect = [self.limited, self.ready]
+        with patch("bot.load_config", return_value={"pairs": [cfg]}), \
+             patch("bot.utc_now", side_effect=lambda: NOW + timedelta(seconds=self.monotonic - 100)), \
+             self.assertLogs(bot.logger, level="WARNING"):
+            with self.assertRaises(KeyboardInterrupt):
+                bot.main()
+        self.assertIn("超时结束跟踪", self.notifier.send.call_args_list[0].args[0])
+        self.assertIn("自然经过 48.01 小时", self.notifier.send.call_args_list[0].args[0])
+        self.assertIsNone(self.state.shadow_position("custom"))
+        self.assertEqual(self.session.get.call_count, 2)
+        self.assertEqual(sum(self.waits[:-1]), 75)
+        self.assertLessEqual(self.waits[0], 30)
+        self.poll.assert_called_once()
+
     def test_startup_unknown_ticker_still_fails_without_retry(self):
         self.rows.pop()
         with self.assertLogs(bot.logger, level="ERROR") as logs:

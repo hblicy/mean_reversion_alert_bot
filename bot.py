@@ -486,7 +486,8 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def init_monitors(config: dict[str, Any], state: AlertState,
-                  *, retry_unavailable: bool = False) -> list[dict[str, Any]]:
+                  *, retry_unavailable: bool = False,
+                  notifier: TelegramNotifier | None = None) -> list[dict[str, Any]]:
     validate_config(config)
     monitors = []
     sources = {}
@@ -501,9 +502,18 @@ def init_monitors(config: dict[str, Any], state: AlertState,
                     source.validate_legs(item["legs"])
                     break
                 except MarketDataUnavailable as exc:
+                    delay = max(1.0, source.retry_at - time.monotonic())
+                    if notifier is not None:
+                        for cfg in config["pairs"]:
+                            if not cfg.get("enabled", True):
+                                continue
+                            position = state.shadow_position(cfg["id"])
+                            if position:
+                                send_timeout(cfg, position, state, notifier)
+                                if cfg.get("max_holding_hours", 0) > 0:
+                                    delay = min(delay, float(config.get("check_interval_sec", 30)))
                     if not retry_unavailable:
                         raise
-                    delay = max(1.0, source.retry_at - time.monotonic())
                     logger.warning("Startup market data unavailable: %s; retrying validation in %.1fs", exc, delay)
                     time.sleep(delay)
                     source.begin_cycle()
@@ -851,26 +861,42 @@ def accept_sample(cfg: dict[str, Any], snap: PriceSnapshot, timestamps: list[flo
 
 def send_timeout(cfg: dict[str, Any], position: dict[str, Any], state: AlertState, notifier: TelegramNotifier) -> bool:
     hours = (utc_now() - parse_timestamp(position["entry_time"])).total_seconds() / 3600
-    limit = float(cfg.get("max_holding_hours", 72))
-    if hours < limit:
+    always = "legs" not in cfg or all(leg["session"] == "always" for leg in cfg["legs"].values())
+    limit = float(cfg.get("max_holding_hours", 72 if always else 0))
+    if limit <= 0 or hours < limit:
         return False
+    if "legs" in cfg and cfg.get("shadow_mode"):
+        logger.info("SHADOW %s timeout due after %.2f wall-clock hours (limit %g)", cfg["label"], hours, limit)
+        return True
     signal = Signal("CLOSE", "CLOSE_" + position["direction"], "", "")
     if "legs" in cfg:
         a, b = (cfg["legs"][key]["name"] for key in ("a", "b"))
         signal.action = f"空 {a} / 多 {b}" if position.get("ratio_side") == "short_ratio" else f"多 {a} / 空 {b}"
-    message = (f"🔵 [CLOSE] {cfg['label']} 超时结束跟踪提醒\n"
-               "行情源：Variational\n"
-               f"原因：ENTRY 信号已持续 {hours:.2f} 小时，达到 {limit:g} 小时上限。\n"
-               f"方向：{action_label(signal)}\n"
-               "无论盈亏都结束本次信号跟踪；若已跟随，请在实际交易平台自行核对两腿持仓、可成交报价及成本，再决定退出。\n"
-               "此提醒不依赖实时行情；不代表你已成交或已经盈利。\n"
-               "信号时间不代表你的实际开仓时间；机器人不会下单。")
+        message = (f"🔵 [CLOSE] {cfg['label']} 超时结束跟踪提醒\n"
+                   f"方向参考：{signal.action}（名义比 {a}:{b} = 1 : {position.get('beta', 1.0):.2f}）\n"
+                   f"原因：自然经过 {hours:.2f} 小时，达到 {limit:g} 小时上限\n"
+                   f"原始 ENTRY：{parse_timestamp(position['entry_time']).astimezone(BEIJING):%Y-%m-%d %H:%M:%S} 北京时间\n"
+                   f"时间：{utc_now().astimezone(BEIJING):%Y-%m-%d %H:%M:%S} 北京时间\n"
+                   "此提醒不依赖实时行情；仅结束信号跟踪，不自动下单，请自行核对持仓与报价。")
+    else:
+        message = (f"🔵 [CLOSE] {cfg['label']} 超时结束跟踪提醒\n"
+                   "行情源：Variational\n"
+                   f"原因：ENTRY 信号已持续 {hours:.2f} 小时，达到 {limit:g} 小时上限。\n"
+                   f"方向：{action_label(signal)}\n"
+                   "无论盈亏都结束本次信号跟踪；若已跟随，请在实际交易平台自行核对两腿持仓、可成交报价及成本，再决定退出。\n"
+                   "此提醒不依赖实时行情；不代表你已成交或已经盈利。\n"
+                   "信号时间不代表你的实际开仓时间；机器人不会下单。")
     if notifier.send(message):
         state.clear_shadow_position(cfg["id"])
         state.mark_sent(entry_cooldown_key(cfg, position["direction"]))
+        logger.info("%s CLOSE delivered pair=%s entry_time=%s direction=%s wall_hours=%.6f "
+                    "reason=wall_timeout limit_hours=%g",
+                    cfg["label"], cfg["id"], position["entry_time"], position["direction"], hours, limit)
         state.save()
     else:
-        logger.warning("%s timeout notification not delivered; retaining position for retry", cfg["label"])
+        logger.warning("%s timeout notification not delivered; retaining position for retry "
+                       "pair=%s entry_time=%s wall_hours=%.6f limit_hours=%g",
+                       cfg["label"], cfg["id"], position["entry_time"], hours, limit)
     return True
 
 
@@ -926,9 +952,9 @@ def pair_close_signal(cfg, snap, position, z):
         boundary = mu + sign * sigma * position["reference_z_close"]
         if move > 0 and ((current <= boundary) if sign == 1 else (current >= boundary)):
             reasons.append("价差已回归 ENTRY 固定均值区间或越过该区间")
-    max_z = cfg.get("entry_max_z", 0)
-    if z is not None and max_z > 0 and z * sign > max_z and move < 0:
-        reasons.append(f"风险提醒：价差继续恶化且滚动 |Z| 超过 {max_z:g}")
+        risk_max_z = cfg.get("risk_max_reference_z", 0)
+        if risk_max_z > 0 and reference_z * sign >= risk_max_z and move < 0:
+            reasons.append(f"风险提醒：价差较 ENTRY 继续恶化，固定基准方向 Z 达到 {risk_max_z:g} 上限")
     if not reasons:
         return None
     a, b = (cfg["legs"][key]["name"] for key in ("a", "b"))
@@ -961,7 +987,10 @@ def format_pair_message(cfg, snap, z, signal):
             lines.append("（休市期间到期，开市后补发）")
     else:
         limit = cfg.get("max_holding_hours", 72) if always else cfg.get("max_holding_trading_hours", 46)
-        lines.append(f"最多跟踪 {limit:g} 个{'自然' if always else '交易'}小时{pause_note}")
+        tracking_limit = f"最多跟踪 {limit:g} 个{'自然' if always else '交易'}小时{pause_note}"
+        if not always and cfg.get("max_holding_hours"):
+            tracking_limit += f"；自然时间上限 {cfg['max_holding_hours']:g} 小时"
+        lines.append(tracking_limit)
     lines.extend([f"中间价：{snap.base} {snap.base_price:,.4f}｜{snap.quote} {snap.quote_price:,.4f}",
                   f"时间：{utc_now().astimezone(BEIJING):%Y-%m-%d %H:%M:%S} 北京时间",
                   "仅信号跟踪，不代表实际开仓时间或持仓盈亏；不自动下单，请在 Variational 核对报价与成本。"])
@@ -1010,12 +1039,9 @@ def run_pair(cfg, state, notifier, force=False):
         advance_pair_clock(cfg, position, now)
         state.set_shadow_position(ident, position)
         hours = pair_trading_hours(cfg, position, now)
-        limit = cfg.get("max_holding_hours", 72) if all(leg["session"] == "always" for leg in cfg["legs"].values()) else cfg.get("max_holding_trading_hours", 46)
-        if all(leg["session"] == "always" for leg in cfg["legs"].values()) and hours >= limit:
-            if cfg.get("shadow_mode"):
-                logger.info("SHADOW %s timeout due after %.2f wall-clock hours", cfg["label"], hours)
-            else:
-                send_timeout(cfg, position, state, notifier)
+        always = all(leg["session"] == "always" for leg in cfg["legs"].values())
+        limit = cfg.get("max_holding_hours", 72) if always else cfg.get("max_holding_trading_hours", 46)
+        if send_timeout(cfg, position, state, notifier):
             return
     try:
         snap = cfg["_source"].snapshot(cfg.get("pair", ident), cfg)
@@ -1426,7 +1452,7 @@ def main() -> int:
         state_path = ROOT / state_path
     state = AlertState(state_path)
     try:
-        monitors = init_monitors(config, state, retry_unavailable=not args.once)
+        monitors = init_monitors(config, state, retry_unavailable=not args.once, notifier=notifier)
     except (ValueError, requests.RequestException) as exc:
         logger.error("Startup validation failed: %s", exc)
         return 1
