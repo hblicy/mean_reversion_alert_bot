@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 from spread import SpreadCalculator, spread_value
 from sessions import SessionCalendar, BEIJING, ET
 from configuration import validate_config
+from market_history import MarketHistory
 
 
 ROOT = Path(__file__).resolve().parent
@@ -57,6 +58,7 @@ class LegQuote:
     base_spread_bps: float | None = None
     funding: dict | None = None
     status: str = "CLOSED_OR_NO_QUOTE"
+    funding_raw: dict | None = None
 
 
 @dataclass
@@ -406,6 +408,7 @@ class VariationalV2Source(HttpSource):
             setattr(result, key, value if isfinite(value) else None)
         funding = row.get("funding")
         if isinstance(funding, dict):
+            result.funding_raw = funding
             rates = funding.get("last") if result.contract_type == "perpetual" else funding.get("next") or funding.get("last")
             keys = ("annualized_rate",) if result.contract_type == "perpetual" else ("annualized_long_rate", "annualized_short_rate")
             if isinstance(rates, dict):
@@ -439,6 +442,7 @@ class VariationalV2Source(HttpSource):
         assets = {legs[key]["name"]: {
             "bid": quote.bid, "ask": quote.ask, "quote_updated_at": quote.updated_at.isoformat(),
             "price_source": "quote", "funding": quote.funding, "base_spread_bps": quote.base_spread_bps,
+            "funding_raw": quote.funding_raw, "mark_price": quote.mark_price,
         } for key, quote in zip(("a", "b"), quotes)}
         return PriceSnapshot(legs["a"]["name"], legs["b"]["name"], a.mid, b.mid, a.mid / b.mid,
                              self.name, utc_now(), {"assets": assets, "quote_size": cfg.get("quote_size", "size_1k")})
@@ -1031,10 +1035,14 @@ def pair_summary(cfg, status, ages="N/A", *, position=None):
 
 def run_pair(cfg, state, notifier, force=False):
     ident, now = cfg["id"], utc_now()
+    history = cfg.get("_market_history")
+    observation = history.begin(cfg, now) if history is not None else None
     pending_entries = state.data.setdefault("pending_entries", {})
     quality = state.data.setdefault("quality", {}).setdefault(ident, {})
     position = state.shadow_position(ident)
     scheduled_open = cfg["_calendar"].pair_is_open(cfg["legs"], now)
+    if observation is not None:
+        observation["scheduled_open"] = scheduled_open
     if position:
         advance_pair_clock(cfg, position, now)
         state.set_shadow_position(ident, position)
@@ -1042,12 +1050,21 @@ def run_pair(cfg, state, notifier, force=False):
         always = all(leg["session"] == "always" for leg in cfg["legs"].values())
         limit = cfg.get("max_holding_hours", 72) if always else cfg.get("max_holding_trading_hours", 46)
         if send_timeout(cfg, position, state, notifier):
+            if observation is not None:
+                observation["reason"] = "natural_timeout"
             return
+    if observation is not None:
+        observation["status"] = "fetching"
     try:
         snap = cfg["_source"].snapshot(cfg.get("pair", ident), cfg)
-    except MarketDataUnavailable:
+    except MarketDataUnavailable as exc:
+        if observation is not None:
+            observation.update(status="unavailable", reason=str(exc))
         raise
     except MarketDataError as exc:
+        if observation is not None:
+            observation.update(status="closed_or_no_quote" if str(exc) == "CLOSED_OR_NO_QUOTE" else "data_error",
+                               reason=str(exc))
         pending_entries.pop(ident, None)
         if str(exc) == "CLOSED_OR_NO_QUOTE":
             quality["closed"] = True
@@ -1057,14 +1074,20 @@ def run_pair(cfg, state, notifier, force=False):
             pair_summary(cfg, "CLOSED_OR_NO_QUOTE", position=position)
             return
         raise
+    if observation is not None:
+        history.attach_snapshot(observation, snap)
     try:
         timestamps = validate_snapshot(cfg, snap)
     except (ValueError, KeyError, TypeError) as exc:
+        if observation is not None:
+            observation.update(status="rejected", reason=str(exc))
         pending_entries.pop(ident, None)
         pair_summary(cfg, f"REJECTED ({exc})", position=position)
         return
     previous_times = state.data.setdefault("latest_quote_timestamps", {}).get(ident, [])
     if any(t < p for t, p in zip(timestamps, previous_times)):
+        if observation is not None:
+            observation.update(status="rejected", reason="timestamp regression")
         pair_summary(cfg, "REJECTED timestamp regression", position=position)
         return
     state.data["latest_quote_timestamps"][ident] = timestamps
@@ -1073,6 +1096,8 @@ def run_pair(cfg, state, notifier, force=False):
         quality["mismatch_day"] = now.astimezone(ET).date().isoformat()
     interval = cfg.get("sample_interval_sec", 600)
     bucket = int(min(timestamps) // interval)
+    if observation is not None:
+        observation.update(status="valid", bucket=bucket)
     previous = state.data.setdefault("samples", {}).get(ident, {})
     candidate = previous.get("bucket", -1) < bucket and all(t > p for t, p in zip(timestamps, previous.get("timestamps", [])))
     calc = cfg["_calc"]
@@ -1105,9 +1130,13 @@ def run_pair(cfg, state, notifier, force=False):
             quality["checked_bucket"] = bucket
             quality["stale"] = stale
         if quality.get("stale"):
+            if observation is not None:
+                observation.update(status="stale", reason="flat quote buckets")
             pair_summary(cfg, "STALE", position=position)
             return
     elif quality.get("stale"):
+        if observation is not None:
+            observation.update(status="stale", reason="flat quote buckets")
         pair_summary(cfg, "STALE", position=position)
         return
     cfg["_last_valid_quote"] = min(timestamps)
@@ -1119,7 +1148,10 @@ def run_pair(cfg, state, notifier, force=False):
         beta = calc.current_beta(bucket)
         values = calc.values(beta, bucket)
         previous_spread = values[-1] if values else None
-        z, reference, beta = calc.add({"bucket": bucket, "ts": min(timestamps), "a_mid": snap.base_price, "b_mid": snap.quote_price})
+        sample = {"bucket": bucket, "ts": min(timestamps), "a_mid": snap.base_price, "b_mid": snap.quote_price}
+        z, reference, beta = calc.add(sample)
+        if observation is not None:
+            observation["sample"] = sample
         state.data["samples"][ident] = {"interval": interval, "bucket": bucket, "timestamps": timestamps}
         state.set_history(ident, calc.dump_history())
         cfg["_prev_z"] = z
@@ -1460,13 +1492,21 @@ def main() -> int:
         logger.error("No enabled monitors in %s", config_path)
         return 1
 
+    history = MarketHistory(state_path.with_name("market_history.sqlite3"))
+    for cfg in monitors:
+        cfg["_market_history"] = history
+    logger.info("Market history enabled: path=%s", history.path)
+
     logger.info("Started %s monitor(s). This bot is alert-only and never places orders.", len(monitors))
     health = BotHealth(state)
     while True:
         failed = False
         try:
-            run_once(monitors, state, notifier, force=args.force_alert)
-            failed = any(cfg.get("_cycle_error", False) for cfg in monitors)
+            try:
+                run_once(monitors, state, notifier, force=args.force_alert)
+                failed = any(cfg.get("_cycle_error", False) for cfg in monitors)
+            finally:
+                history.flush()
         except Exception:
             failed = True
             logger.exception("Polling cycle failed; keeping bot alive for the next cycle")

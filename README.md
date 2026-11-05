@@ -58,6 +58,35 @@ https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/v2/stats
 
 状态保存采用临时文件、flush、fsync 和原子替换。已有状态无法读取或 JSON 损坏时拒绝启动，保留原文件。正常运行时，单组合异常不阻止其他组合，主循环记录完整堆栈并继续下一轮。
 
+## 长期行情历史
+
+进入正常轮询后，启用的 `legs` 组合会自动追加到 `state/market_history.sqlite3`；自定义 `state_file` 时，历史库放在该状态文件的同一目录。使用 Python 自带的 SQLite，无需新增依赖或修改配置。原 JSON 状态和滚动窗口仍按原逻辑维护，β、入场条件、采样周期与行情请求次数不变。
+
+- `observations` 保存每轮观察，默认约每 30 秒一次：轮询开始时间、收到报价的时间、两腿 bid/ask 与中间价、接口报价时间、标记价格、点差、资金费、报价档位和当时的模型/时段配置。轮询和接收时间统一为 UTC，接口时间字段保留原始信息。
+- `samples` 保存实际进入统计窗口的十分钟样本；JSON `payload` 的 `sample` 字段沿用 `{bucket, ts, a_mid, b_mid}`。按组合、行情源、双腿 ticker、报价档位、采样周期和桶去重，重复处理不会覆盖原样本。不同市场序列应分开回测。
+- 休市、无报价、请求失败、过期/不同步/时间回退及平价检测会保留对应状态；无报价时不补价格。桶内有效报价保留在 `observations`，不会冒充新的统计样本。
+- v2 的 `funding_raw` 保留接口的 `next` / `last` 与时间字段；`funding` 是当时解析的年化费率，均不等于账户实际资金费流水。归档只保存行情与模型字段，不保存 `.env`、Token 或运行对象。
+
+历史库持续追加，不随窗口淘汰、统计重置、日期变化或重启清空，也不会自动按保留期删除。从升级后运行开始积累，不回填此前未保存的报价；已有状态快照请继续保留，以便后续合并旧中间价样本。
+
+每轮先处理信号，再以 SQLite 事务提交历史。写入失败会保留待写批次并在后续轮询重试，日志包含文件路径及完整错误链，并计入现有健康检查失败轮数；不会清空损坏的库。未写成功的批次暂存在内存，进程退出前仍未恢复写入时，该批次无法保证保留。
+
+历史库属于运行数据，不提交 GitHub。备份或下载前，可停机后复制，或在运行中用 SQLite backup API 生成一致快照；不要只复制正在写入的 WAL 数据库主文件。例如在项目目录执行：
+
+```bash
+python3 - <<'PY'
+import sqlite3
+import time
+from contextlib import closing
+target = f"state/market_history-{time.time_ns()}.sqlite3"
+with closing(sqlite3.connect("file:state/market_history.sqlite3?mode=ro", uri=True)) as source, closing(sqlite3.connect(target)) as backup:
+    source.backup(backup)
+print(target)
+PY
+```
+
+## 运行监控
+
 连续 5 轮失败或共同开市期间 30 分钟无有效报价会推送 `bot degraded`，6 小时冷却。每天 09:00 北京时间后首轮发送一次心跳，包含每组窗口进度、最新报价年龄、开闭市状态、跟踪状态；重启后可补发当日未送达的心跳。
 
 日志由 bot.py 写入 `logs/alert-bot.log`，轮转阈值为 10 MiB，保留 5 份备份（`.1` 最新、`.5` 最旧），正常总量约 60 MiB；单条超大日志可能超过轮转阈值。已有超大历史备份不会在启动时截断；先保留作排查证据，归档后再人工清理，不应据此直接认定当前轮转失效。`start.sh` 不再同时重定向到同一个文件，避免重复写入及轮转失效；其他启动方式也不要使用 `>> logs/alert-bot.log 2>&1`。systemd 示例见 [deploy/alert-bot.service](deploy/alert-bot.service)，部署前修改 User、WorkingDirectory、EnvironmentFile 和 ExecStart；该文件仅供部署参考，不会自动安装或启用。

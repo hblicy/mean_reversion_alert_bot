@@ -3,4 +3,5 @@ __pycache__/
 *.pyc
 logs/
 state/
+market_history.sqlite3*
 bot.pid
